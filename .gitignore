@@ -1,0 +1,24 @@
+# 忽略編譯檔
+__pycache__/
+*.pyc
+
+# 忽略數據資料夾 (通常數據太大，不放 git)
+data/
+
+# 忽略模型權重檔 (通常很大，超過100MB GitHub會拒收)
+models/
+*.bin
+*.pth
+*.pt
+
+# 忽略執行紀錄和輸出結果
+logs/
+output/
+rub/
+*.log
+*.csv
+*.json
+
+# 忽略系統自動產生的檔案
+.DS_Store
+.vscode/
