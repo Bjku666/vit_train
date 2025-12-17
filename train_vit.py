@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import logging
+import glob
 
 import cv2
 import numpy as np
@@ -33,6 +34,65 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import config
 from model import get_model
 from dataset import MedicalDataset
+
+
+def _apply_mixup(images: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """对一个 batch 做标准 Mixup。
+
+    说明：
+    - 二分类 BCEWithLogitsLoss 下，label 是 float (0/1)，mixup 后仍是 float。
+    - 这里只实现 Mixup（不做 CutMix/旋转），严格按你的正则化要求“止血”。
+    """
+    if not getattr(config, 'USE_MIXUP', False):
+        return images, labels
+    prob = float(getattr(config, 'MIXUP_PROB', 1.0))
+    if prob <= 0.0 or np.random.rand() > prob:
+        return images, labels
+
+    alpha = float(getattr(config, 'MIXUP_ALPHA', 0.8))
+    if alpha <= 0.0:
+        return images, labels
+
+    lam = float(np.random.beta(alpha, alpha))
+    batch_size = images.size(0)
+    index = torch.randperm(batch_size, device=images.device)
+
+    mixed_images = images.mul(lam).add(images[index].mul(1.0 - lam))
+    labels = labels.view(-1)
+    mixed_labels = labels.mul(lam).add(labels[index].mul(1.0 - lam))
+    return mixed_images, mixed_labels
+
+
+def _search_best_threshold_from_oof(oof_paths: list[str]) -> tuple[float, float]:
+    """从 OOF 文件搜索全局最佳 Accuracy 阈值（与 inference 对齐：0.2~0.8，步长 0.001）。"""
+    if not oof_paths:
+        return 0.5, -1.0
+
+    probs_all: list[np.ndarray] = []
+    targets_all: list[np.ndarray] = []
+    for p in oof_paths:
+        df = pd.read_csv(p)
+        if 'Preds' not in df.columns or 'Targets' not in df.columns:
+            continue
+        probs_all.append(df['Preds'].values.astype(np.float32))
+        targets_all.append(df['Targets'].values.astype(np.int64))
+
+    if not probs_all:
+        return 0.5, -1.0
+
+    probs = np.concatenate(probs_all, axis=0)
+    targets = np.concatenate(targets_all, axis=0)
+
+    thresholds = np.linspace(0.2, 0.8, 601, dtype=np.float32)
+    best_t = 0.5
+    best_acc = -1.0
+    for t in thresholds:
+        preds = (probs >= t).astype(np.int64)
+        acc = float((preds == targets).mean())
+        if acc > best_acc or (acc == best_acc and float(t) < best_t):
+            best_acc = acc
+            best_t = float(t)
+    return best_t, best_acc
 
 
 def _interpolate_pos_embed_in_state_dict(state_dict: dict, key: str, target_shape: torch.Size) -> None:
@@ -203,7 +263,24 @@ def main():
                     target_pos_shape = model_for_keys.backbone.pos_embed.shape
                     _interpolate_pos_embed_in_state_dict(state_dict, 'backbone.pos_embed', target_pos_shape)
 
-                    model.load_state_dict(state_dict, strict=True)
+                    # 权重健康检查（可选但很关键）：打印 missing/unexpected 的前几项，确保 backbone 对齐
+                    incompatible = model.load_state_dict(state_dict, strict=False)
+                    missing = list(getattr(incompatible, 'missing_keys', []))
+                    unexpected = list(getattr(incompatible, 'unexpected_keys', []))
+                    if missing or unexpected:
+                        logger.warning(f"[Stage2] load_state_dict 非 strict 检查：missing={len(missing)}, unexpected={len(unexpected)}")
+                        if missing:
+                            logger.warning(f"[Stage2] missing_keys(前10): {missing[:10]}")
+                        if unexpected:
+                            logger.warning(f"[Stage2] unexpected_keys(前10): {unexpected[:10]}")
+
+                        # 只允许 head 类小范围不匹配；任何 backbone 缺失/多余都直接报错
+                        bad_missing = [k for k in missing if k.startswith('backbone.')]
+                        bad_unexpected = [k for k in unexpected if k.startswith('backbone.')]
+                        if bad_missing or bad_unexpected:
+                            raise RuntimeError(
+                                f"[Stage2] Backbone 权重不一致：missing(backbone)={bad_missing[:5]}, unexpected(backbone)={bad_unexpected[:5]}"
+                            )
                 else:
                     logger.warning(f"[Stage2] 未找到 Stage1 权重: {stage1_path}，将从 RETFound 初始化开始训练")
             else:
@@ -241,11 +318,17 @@ def main():
             for step, (images, labels) in enumerate(pbar):
                 images = images.to(config.DEVICE)
                 # BCEWithLogitsLoss 需要 float 标签
-                labels = labels.to(config.DEVICE).float()
+                labels = labels.to(config.DEVICE).float().view(-1)
+
+                # ===== Mixup 强正则化（按你的 Checklist 强制开启） =====
+                images, labels = _apply_mixup(images, labels)
 
                 # 仅在每个 epoch 的第一个 step 记录一次图片，避免日志过大
                 # 反归一化 (De-normalization) 以便人眼观看（假设 mean/std = 0.5）
-                outputs = model(images)  # (B,) logits
+                outputs = model(images)
+                if outputs.ndim == 2 and outputs.size(1) == 1:
+                    outputs = outputs[:, 0]
+                outputs = outputs.view(-1)
                 loss = criterion(outputs, labels)
                 loss_val = loss.item()
                 loss = loss / config.ACCUM_STEPS
@@ -337,6 +420,29 @@ def main():
         torch.cuda.empty_cache()
 
     logger.info("训练完成。")
+
+    # === 训练结束：用 OOF 搜索全局最佳阈值，并固化到 output（供 inference 直接复用） ===
+    try:
+        oof_paths = sorted(glob.glob(os.path.join(config.OOF_DIR, 'oof_fold_*.csv')))
+        if oof_paths:
+            best_t, best_acc = _search_best_threshold_from_oof(oof_paths)
+            payload = {
+                'run_id': config.RUN_ID,
+                'stage': int(config.CURRENT_STAGE),
+                'threshold': float(best_t),
+                'acc': float(best_acc),
+                'oof_files': [os.path.basename(p) for p in oof_paths],
+            }
+            os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+            path_run = os.path.join(config.OUTPUT_DIR, f'best_threshold_{config.RUN_ID}.json')
+            path_latest = os.path.join(config.OUTPUT_DIR, 'best_threshold.json')
+            with open(path_run, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            with open(path_latest, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            logger.info(f"[OOF] 全局最佳阈值已固化：t={best_t:.4f}, acc={best_acc:.6f} | {path_latest}")
+    except Exception as e:
+        logger.warning(f"[OOF] 阈值固化失败（不影响训练权重保存）：{e}")
 
 if __name__ == '__main__':
     main()

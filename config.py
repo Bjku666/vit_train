@@ -110,7 +110,8 @@ elif CURRENT_STAGE == 2:
 	# Stage 2: 512 分辨率 (显存压力显著增加)
 	IMAGE_SIZE = 512
 	EPOCHS = 10
-	BASE_LR = 2e-6
+	# 按你的 Checklist：Stage2 学习率约为 Stage1 的 1/10，防止破坏已学到的表征
+	BASE_LR = 1e-6
 
 	# 显存配置 (512px) - 建议调小 batch 防止 OOM
 	BATCH_SIZE = 4

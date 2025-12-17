@@ -95,6 +95,51 @@ def search_best_threshold(probs: np.ndarray, targets: np.ndarray) -> float:
     return best_t
 
 
+def _load_solid_threshold() -> float | None:
+    """从 output/best_threshold.json 读取固化阈值（由训练/评测脚本写入）。"""
+    path = os.path.join(config.OUTPUT_DIR, 'best_threshold.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_json(path)
+        # 兼容 dict/json
+        if isinstance(df, pd.Series):
+            t = float(df.get('threshold', np.nan))
+        else:
+            # 不太可能走到这里
+            t = float(df['threshold'].iloc[0])
+        if np.isfinite(t):
+            return t
+    except Exception:
+        pass
+    try:
+        import json
+        with open(path, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+        t = float(obj.get('threshold', float('nan')))
+        return t if np.isfinite(t) else None
+    except Exception:
+        return None
+
+
+def _save_solid_threshold(best_threshold: float, oof_files: list[str]) -> None:
+    """将 OOF 搜出来的阈值固化到 output/best_threshold.json，供后续推理直接复用。"""
+    try:
+        import json
+        os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+        payload = {
+            'run_id': config.RUN_ID,
+            'stage': int(getattr(config, 'CURRENT_STAGE', 0)),
+            'threshold': float(best_threshold),
+            'oof_files': [os.path.basename(p) for p in oof_files],
+        }
+        path_latest = os.path.join(config.OUTPUT_DIR, 'best_threshold.json')
+        with open(path_latest, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        return
+
+
 def tta_2x(images: torch.Tensor):
     """严格 2x TTA：仅原图 + 水平翻转（不做任何旋转）"""
     return [images, torch.flip(images, dims=[3])]
@@ -112,17 +157,26 @@ def main():
         oof_files.extend(glob.glob(os.path.join(config.OOF_DIR, 'oof_fold_*.csv')))
 
     oof_files = sorted(oof_files)
-    if not oof_files:
-        print(f"⚠️  警告: 未找到 OOF 文件，将使用默认阈值 0.5。请检查 {config.OOF_DIR}")
-        best_threshold = 0.5
-    else:
-        print(f"[Info] 加载 {len(oof_files)} 个 OOF 文件进行阈值搜索...")
-        probs, targets = load_oof(oof_files)
-        if len(targets) == 0:
-             print("⚠️  OOF文件为空，使用默认阈值0.5")
-             best_threshold = 0.5
+    best_threshold = None
+    if not args.only_eval:
+        best_threshold = _load_solid_threshold()
+        if best_threshold is not None:
+            print(f"[Info] 使用固化阈值 output/best_threshold.json: {best_threshold:.4f}")
+
+    if best_threshold is None:
+        if not oof_files:
+            print(f"⚠️  警告: 未找到 OOF 文件，将使用默认阈值 0.5。请检查 {config.OOF_DIR}")
+            best_threshold = 0.5
         else:
-             best_threshold = search_best_threshold(probs, targets)
+            print(f"[Info] 加载 {len(oof_files)} 个 OOF 文件进行阈值搜索...")
+            probs, targets = load_oof(oof_files)
+            if len(targets) == 0:
+                print("⚠️  OOF文件为空，使用默认阈值0.5")
+                best_threshold = 0.5
+            else:
+                best_threshold = search_best_threshold(probs, targets)
+                if not args.only_eval:
+                    _save_solid_threshold(best_threshold, oof_files)
 
     # === [核心逻辑] 如果只是评测，到这里就结束 ===
     if args.only_eval:
