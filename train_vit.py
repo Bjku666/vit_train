@@ -9,6 +9,7 @@
 """
 
 import argparse
+import json
 import os
 import sys
 import logging
@@ -20,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
 
@@ -31,6 +33,43 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import config
 from model import get_model
 from dataset import MedicalDataset
+
+
+def _interpolate_pos_embed_in_state_dict(state_dict: dict, key: str, target_shape: torch.Size) -> None:
+    """将 state_dict[key] 的 ViT pos_embed 插值到目标形状。
+
+    用途：Stage2 需要加载 Stage1 权重，但 Stage1(384) 的 pos_embed 网格是 24x24，
+    Stage2(512) 是 32x32；必须插值，否则无法 strict load 或者特征错位。
+    """
+    if key not in state_dict:
+        return
+
+    pos_embed = state_dict[key]
+    if not isinstance(pos_embed, torch.Tensor):
+        return
+    if tuple(pos_embed.shape) == tuple(target_shape):
+        return
+
+    # 形状约定：(1, 1+N, D)
+    if pos_embed.ndim != 3:
+        return
+
+    num_extra_tokens = 1
+    embedding_size = pos_embed.shape[-1]
+
+    n_old = pos_embed.shape[1] - num_extra_tokens
+    n_new = target_shape[1] - num_extra_tokens
+    old_size = int((n_old) ** 0.5)
+    new_size = int((n_new) ** 0.5)
+    if old_size * old_size != n_old or new_size * new_size != n_new:
+        return
+
+    extra_tokens = pos_embed[:, :num_extra_tokens]
+    pos_tokens = pos_embed[:, num_extra_tokens:]
+    pos_tokens = pos_tokens.reshape(-1, old_size, old_size, embedding_size).permute(0, 3, 1, 2)
+    pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+    pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+    state_dict[key] = torch.cat((extra_tokens, pos_tokens), dim=1)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,8 +85,29 @@ logger = logging.getLogger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description='RETFound+GeM Training (Binary)')
     # Stage2 时从 Stage1 warm-start 的模型目录（可覆盖 config.STAGE1_MODELS_DIR）
-    parser.add_argument('--stage1_models_dir', type=str, default='', help='Stage1 模型目录（包含 vit_fold{X}.pth）')
+    parser.add_argument('--stage1_models_dir', type=str, default='', help='Stage1 模型目录（包含 vit_stage1_fold{X}.pth 或 vit_fold{X}.pth）')
     return parser.parse_args()
+
+
+def _read_stage1_step_offset(tb_fold_dir: str) -> int:
+    """读取 Stage1 的全局步数末尾，用于让 Stage2 的 TensorBoard 曲线接着画。"""
+    meta_path = os.path.join(tb_fold_dir, 'meta_stage1.json')
+    if not os.path.exists(meta_path):
+        return 0
+    try:
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        end_step = int(meta.get('global_step_end', -1))
+        return max(end_step + 1, 0)
+    except Exception:
+        return 0
+
+
+def _write_stage1_meta(tb_fold_dir: str, global_step_end: int) -> None:
+    os.makedirs(tb_fold_dir, exist_ok=True)
+    meta_path = os.path.join(tb_fold_dir, 'meta_stage1.json')
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump({'global_step_end': int(global_step_end)}, f, ensure_ascii=False, indent=2)
 
 
 def build_transforms():
@@ -88,6 +148,7 @@ def main():
     logger.info(f"启动训练 | Stage={config.CURRENT_STAGE} | Image={config.IMAGE_SIZE} | GPU={gpu_count}")
     logger.info(f"Batch={config.BATCH_SIZE} | Accum={config.ACCUM_STEPS} | EquivBatch={config.BATCH_SIZE * config.ACCUM_STEPS}")
     logger.info(f"LR={config.BASE_LR} | Epochs={config.EPOCHS}")
+    logger.info(f"RUN_ID={config.RUN_ID} | TB LogDir={config.CURRENT_LOG_DIR}")
 
     train_transform, val_transform = build_transforms()
 
@@ -103,6 +164,12 @@ def main():
         fold_idx = fold + 1
         logger.info(f"\n===== Fold {fold_idx}/{config.K_FOLDS} =====")
 
+        # TensorBoard：同一个 RUN_ID 下，fold 写到固定目录。
+        # 如果 Stage2 复用同一个 RUN_ID，则会在同一条曲线上继续追加 step。
+        tb_fold_dir = os.path.join(config.CURRENT_LOG_DIR, f'fold_{fold_idx}')
+        writer = SummaryWriter(log_dir=tb_fold_dir)
+        step_offset = _read_stage1_step_offset(tb_fold_dir) if config.CURRENT_STAGE == 2 else 0
+
         train_ds = MedicalDataset(config.TRAIN_DIRS, mode='train', transform=train_transform, indices=train_idx, image_paths=all_paths)
         val_ds = MedicalDataset(config.TRAIN_DIRS, mode='val', transform=val_transform, indices=val_idx, image_paths=all_paths)
 
@@ -117,7 +184,10 @@ def main():
         if config.CURRENT_STAGE == 2:
             stage1_dir = (args.stage1_models_dir or config.STAGE1_MODELS_DIR).strip()
             if stage1_dir:
-                stage1_path = os.path.join(stage1_dir, f'vit_fold{fold_idx}.pth')
+                stage1_path_a = os.path.join(stage1_dir, f'vit_stage1_fold{fold_idx}.pth')
+                stage1_path_b = os.path.join(stage1_dir, f'vit_fold{fold_idx}.pth')
+                stage1_path = stage1_path_a if os.path.exists(stage1_path_a) else stage1_path_b
+
                 if os.path.exists(stage1_path):
                     logger.info(f"[Stage2] 加载 Stage1 权重初始化: {stage1_path}")
                     try:
@@ -127,6 +197,12 @@ def main():
                     # 兼容历史上保存了 DataParallel 的 module. 前缀
                     if isinstance(state_dict, dict) and state_dict and next(iter(state_dict.keys())).startswith('module.'):
                         state_dict = {k[7:]: v for k, v in state_dict.items()}
+
+                    # 关键：pos_embed 插值 (Stage1 384 -> Stage2 512)
+                    model_for_keys = model  # 这里尚未 DataParallel
+                    target_pos_shape = model_for_keys.backbone.pos_embed.shape
+                    _interpolate_pos_embed_in_state_dict(state_dict, 'backbone.pos_embed', target_pos_shape)
+
                     model.load_state_dict(state_dict, strict=True)
                 else:
                     logger.warning(f"[Stage2] 未找到 Stage1 权重: {stage1_path}，将从 RETFound 初始化开始训练")
@@ -140,8 +216,19 @@ def main():
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=config.BASE_LR * 0.1)
         
         best_acc = 0.0
-        model_save_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f'vit_fold{fold_idx}.pth')
+        # Stage1/Stage2 命名策略：
+        # - Stage1：保留 vit_stage1_foldX.pth，同时写一份 vit_foldX.pth（便于只跑 Stage1 时也能推理）
+        # - Stage2：写 vit_foldX.pth 作为最终推理权重（会覆盖 Stage1 的同名文件）
+        if config.CURRENT_STAGE == 1:
+            model_save_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f'vit_stage1_fold{fold_idx}.pth')
+            model_alias_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f'vit_fold{fold_idx}.pth')
+        else:
+            model_save_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f'vit_fold{fold_idx}.pth')
+            model_alias_path = None
+
+        # OOF：Stage1 额外保留一份 stage1 文件；Stage2 覆盖 oof_fold_X.csv 作为最终阈值搜索输入
         oof_save_path = os.path.join(config.OOF_DIR, f'oof_fold_{fold_idx}.csv')
+        oof_stage_save_path = os.path.join(config.OOF_DIR, f'oof_stage{config.CURRENT_STAGE}_fold_{fold_idx}.csv')
 
         for epoch in range(config.EPOCHS):
             model.train()
@@ -170,6 +257,11 @@ def main():
                     optimizer.zero_grad()
 
                 train_loss_accum += loss_val
+
+                # TensorBoard（step 级）
+                global_step = step_offset + epoch * len(train_loader) + step
+                writer.add_scalar('Loss/train_step', loss_val, global_step)
+                writer.add_scalar('LR', optimizer.param_groups[0]['lr'], global_step)
 
                 pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
             
@@ -203,6 +295,12 @@ def main():
             avg_train_loss = train_loss_accum / max(len(train_loader), 1)
             avg_val_loss = val_loss_accum / max(len(val_loader), 1)
 
+            # TensorBoard（epoch 级，用 step 对齐，曲线连续）
+            epoch_end_step = step_offset + (epoch + 1) * len(train_loader) - 1
+            writer.add_scalar('Loss/train_epoch', avg_train_loss, epoch_end_step)
+            writer.add_scalar('Loss/val', avg_val_loss, epoch_end_step)
+            writer.add_scalar('Acc/val@0.5', avg_val_acc, epoch_end_step)
+
             logger.info(f"Epoch {epoch+1:02d} | TrainLoss={avg_train_loss:.4f} | ValLoss={avg_val_loss:.4f} | ValAcc@0.5={avg_val_acc:.4f}")
 
             # 每个 epoch 后走一步 scheduler（按 epoch 维度）
@@ -214,11 +312,26 @@ def main():
                 model_to_save = model.module if isinstance(model, nn.DataParallel) else model
                 torch.save(model_to_save.state_dict(), model_save_path)
 
+                if model_alias_path is not None:
+                    torch.save(model_to_save.state_dict(), model_alias_path)
+
                 oof_df = pd.DataFrame({'Preds': oof_probs, 'Targets': oof_targets})
                 oof_df.to_csv(oof_save_path, index=False)
+                oof_df.to_csv(oof_stage_save_path, index=False)
 
                 logger.info(f"   >>> Best Model Saved | Acc@0.5={best_acc:.4f} | {model_save_path}")
+                if model_alias_path is not None:
+                    logger.info(f"   >>> Model Alias Updated: {model_alias_path}")
                 logger.info(f"   >>> OOF Saved: {oof_save_path} (n={len(oof_df)})")
+
+            writer.flush()
+
+        # Stage1 写 meta，供 Stage2 接续 step
+        if config.CURRENT_STAGE == 1:
+            global_step_end = step_offset + config.EPOCHS * len(train_loader) - 1
+            _write_stage1_meta(tb_fold_dir, global_step_end)
+
+        writer.close()
 
         del model, optimizer
         torch.cuda.empty_cache()

@@ -30,7 +30,11 @@ if not os.path.exists(VIT_BASE_384_PATH):
 		VIT_BASE_384_PATH = _old_path
 
 # 1. 生成本次运行的唯一 ID
-RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
+# 说明：为了让 Stage1/Stage2 在 TensorBoard 上“无缝衔接”，允许你手动指定同一个 RUN_ID。
+# 用法：
+# - Stage1：RUN_ID=20251217_120000 CURRENT_STAGE=1 python train_vit.py
+# - Stage2：RUN_ID=20251217_120000 CURRENT_STAGE=2 python train_vit.py --stage1_models_dir models/run_20251217_120000
+RUN_ID = os.environ.get('RUN_ID', '').strip() or datetime.now().strftime('%Y%m%d_%H%M%S')
 
 # 2. 目录配置
 CURRENT_RUN_MODELS_DIR = os.path.join(MODELS_DIR, f'run_{RUN_ID}')

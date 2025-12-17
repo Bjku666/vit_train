@@ -33,13 +33,16 @@ class GeM(nn.Module):
 
 
 class RETFoundViTGeM(nn.Module):
-    """RETFound ViT + GeM Pooling 二分类头
+    """RETFound ViT + 双池化(Mean+GeM) 二分类头
 
-    结构“魔改点”（严格按你的要求）：
+    结构“魔改点”（按你最新总结固化）：
     1) 取 patch tokens（去掉 cls_token）
     2) reshape 回 2D 特征图 (B, C, H, W)
-    3) GeM 聚合得到 (B, C)
-    4) Linear 输出 1 个 logit（配合 BCEWithLogitsLoss）
+    3) 双保险池化：
+       - Mean / GAP：稳，保留整体信息与分布
+       - GeM(p可学习)：准，强调高响应区域，模拟视盘 ROI 关注
+    4) Concat([feat_mean, feat_gem]) 得到 (B, 2C)
+    5) Linear 输出 1 个 logit（配合 BCEWithLogitsLoss）
 
     关键点：H/W 不写死，通过 token 数量动态推导，兼容 384/512 等不同分辨率。
     """
@@ -48,7 +51,8 @@ class RETFoundViTGeM(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.gem = GeM()
-        self.head = nn.Linear(embed_dim, num_classes)
+        # 双池化拼接后维度翻倍
+        self.head = nn.Linear(embed_dim * 2, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # --- 复刻 timm ViT 的 token 流水线，确保能拿到“完整 token 序列” ---
@@ -84,11 +88,15 @@ class RETFoundViTGeM(nn.Module):
         # (B, N, D) -> (B, H, W, D) -> (B, D, H, W)
         feat_map = patch_tokens.reshape(b, h, w, d).permute(0, 3, 1, 2).contiguous()
 
-        # 3) GeM pooling: (B, D, H, W) -> (B, D)
-        pooled = self.gem(feat_map)
+        # 3) 双池化：Mean 兜底 + GeM 拔高
+        # Mean/GAP：保留全局信息，提升稳定性
+        feat_mean = feat_map.mean(dim=(-2, -1))				# (B, D)
+        # GeM：更强调高响应区域，细粒度聚焦视盘/杯盘比等结构
+        feat_gem = self.gem(feat_map)						# (B, D)
+        feat = torch.cat([feat_mean, feat_gem], dim=1)	# (B, 2D)
 
-        # 4) Linear head: (B, D) -> (B, 1)
-        logits = self.head(pooled)
+        # 4) Linear head: (B, 2D) -> (B, 1)
+        logits = self.head(feat)
         # 输出 reshape 成 (B,) 更方便 BCEWithLogitsLoss
         return logits.squeeze(-1)
 
