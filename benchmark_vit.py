@@ -1,6 +1,6 @@
 # benchmark_vit.py (最终修正版 - 兼容 DataParallel)
 """
-功能：对验证集做多模型 8x TTA 融合评测，自动搜索最佳阈值并输出 benchmark JSON。
+功能：对验证集做多模型 2x TTA 融合评测（仅原图+水平翻转，严禁旋转），自动搜索最佳阈值并输出 benchmark JSON。
 用法示例：
     CONFIG_INIT_DIRS=0 python benchmark_vit.py --model_paths "models/run_xxx/vit_fold*.pth"
 输出：
@@ -81,37 +81,41 @@ def main():
         print("No models were loaded successfully. Aborting.")
         return
 
-    # 3. 推理 (8x TTA)
+    # 3. 推理 (严格 2x TTA：原图 + 水平翻转)
     all_probs, all_labels = [], []
     
-    print("\nRunning Inference with 8x TTA (Rotation + Flip)...")
+    print("\nRunning Inference with 2x TTA (Identity + HFlip, No Rotation)...")
     with torch.no_grad():
         for images, labels in tqdm(loader):
             images = images.to(config.DEVICE)
-            batch_probs = torch.zeros(images.size(0), 2).to(config.DEVICE)
-            rotations = [0, 1, 2, 3]
+            labels = labels.to(config.DEVICE)
+
+            prob_sum = torch.zeros(images.size(0), device=config.DEVICE)
+            tta_views = [images, torch.flip(images, dims=[3])]
+            denom = float(len(models) * len(tta_views))
             
             for model in models:
-                for k in rotations:
-                    img_rot = torch.rot90(images, k=k, dims=[2, 3])
-                    logits = model(img_rot)
-                    batch_probs += torch.softmax(logits, dim=1)
-                    
-                    img_rot_flip = torch.flip(img_rot, dims=[3])
-                    logits_flip = model(img_rot_flip)
-                    batch_probs += torch.softmax(logits_flip, dim=1)
-            
-            batch_probs /= (len(models) * 8)
-            all_probs.extend(batch_probs[:, 1].cpu().numpy())
-            all_labels.extend(labels.numpy())
+                for view in tta_views:
+                    logits = model(view)
+                    if logits.ndim == 2 and logits.size(1) == 1:
+                        logits = logits[:, 0]
+                    prob_sum += torch.sigmoid(logits)
 
-    # 4. 寻找最佳阈值
-    best_threshold, best_acc, best_f1 = 0.5, 0.0, 0.0
-    for t in np.arange(0.1, 0.9, 0.01):
-        preds = [1 if p > t else 0 for p in all_probs]
-        acc = accuracy_score(all_labels, preds)
-        if acc > best_acc:
-            best_acc, best_f1, best_threshold = acc, f1_score(all_labels, preds), t
+            avg_prob = (prob_sum / denom).detach().cpu().numpy()
+            all_probs.extend(avg_prob)
+            all_labels.extend(labels.detach().cpu().numpy())
+
+    # 4. 寻找最佳阈值（与 inference 对齐：0.2~0.8，步长 0.001）
+    best_threshold, best_acc, best_f1 = 0.5, -1.0, 0.0
+    thresholds = np.linspace(0.2, 0.8, 601, dtype=np.float32)
+    probs_np = np.asarray(all_probs, dtype=np.float32)
+    labels_np = np.asarray(all_labels, dtype=np.int64)
+    for t in thresholds:
+        preds = (probs_np >= t).astype(np.int64)
+        acc = accuracy_score(labels_np, preds)
+        f1 = f1_score(labels_np, preds)
+        if acc > best_acc or (acc == best_acc and float(t) < best_threshold):
+            best_acc, best_f1, best_threshold = acc, f1, float(t)
 
     # 5. 输出结果
     print(f"\n====== Final Benchmark Results ({len(models)} Models) ======")
@@ -119,9 +123,9 @@ def main():
     print(f"Accuracy:       {best_acc:.4f}")
     print(f"F1 Score:       {best_f1:.4f}")
     
-    final_preds = [1 if p > best_threshold else 0 for p in all_probs]
+    final_preds = (probs_np >= best_threshold).astype(np.int64)
     print("Confusion Matrix:")
-    print(confusion_matrix(all_labels, final_preds))
+    print(confusion_matrix(labels_np, final_preds))
 
     # 保存结果
     # 仅创建评测输出目录，不触碰训练日志/模型目录

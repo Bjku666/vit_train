@@ -27,7 +27,7 @@ if [[ "$RUN_INDEX" =~ ^[0-9]+$ ]] && [ "$RUN_INDEX" -le "${#runs[@]}" ] && [ "$R
 else
     RUN_ID=$RUN_INDEX
 fi
-MODEL_DIR="models/run_${RUN_ID}"
+MODEL_DIR="models/${RUN_ID}"
 
 # --- 2. 选择 GPU ---
 echo "----------------------------------------"

@@ -1,7 +1,7 @@
 """inference.py
 功能升级版：
 1. 支持 --only_eval 参数：仅读取 OOF 计算最佳阈值并打印，不进行后续推理（秒级反馈）。
-2. 保持原有的 5fold + 8x TTA 推理逻辑。
+2. 推理使用严格 2x TTA：仅原图 + 水平翻转（严禁 90° 旋转）。
 """
 
 import os
@@ -95,14 +95,9 @@ def search_best_threshold(probs: np.ndarray, targets: np.ndarray) -> float:
     return best_t
 
 
-def tta_8x(images: torch.Tensor):
-    """8x TTA"""
-    outs = []
-    for k in (0, 1, 2, 3):
-        rot = torch.rot90(images, k=k, dims=[2, 3])
-        outs.append(rot)
-        outs.append(torch.flip(rot, dims=[3]))
-    return outs
+def tta_2x(images: torch.Tensor):
+    """严格 2x TTA：仅原图 + 水平翻转（不做任何旋转）"""
+    return [images, torch.flip(images, dims=[3])]
 
 def main():
     args = parse_args()
@@ -169,13 +164,13 @@ def main():
 
     # 推理
     predictions = []
-    print("\nRunning inference on unlabeled test set (8x TTA)...")
+    print("\nRunning inference on unlabeled test set (2x TTA: identity + hflip)...")
     with torch.no_grad():
         for images, filenames in tqdm(loader):
             images = images.to(config.DEVICE)
 
             prob_sum = torch.zeros(images.size(0), device=config.DEVICE)
-            tta_views = tta_8x(images)
+            tta_views = tta_2x(images)
             denom = float(len(models) * len(tta_views))
 
             for model in models:
