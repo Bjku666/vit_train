@@ -19,7 +19,7 @@ if [ -z "$RUN_ID" ]; then
 fi
 
 MODEL_DIR="models/run_${RUN_ID}"
-BENCHMARK_JSON="output/benchmark_result_${RUN_ID}.json"
+BENCHMARK_JSON=""
 
 # 检查模型目录是否存在
 if [ ! -d "$MODEL_DIR" ]; then
@@ -44,9 +44,11 @@ run_benchmark() {
     echo " [Step 1] 正在运行 Benchmark 搜索最佳阈值..."
     # 通配符匹配该次训练的所有 fold 模型
     python benchmark_vit.py --model_paths "${MODEL_DIR}/vit_fold*.pth"
-    
-    if [ ! -f "$BENCHMARK_JSON" ]; then
-        echo " Benchmark 失败，未生成 $BENCHMARK_JSON"
+
+    # benchmark_vit.py 使用当前时间戳命名输出，这里自动取最新生成的结果文件
+    BENCHMARK_JSON=$(ls -1t output/benchmark_result_*.json 2>/dev/null | head -n 1)
+    if [ -z "$BENCHMARK_JSON" ] || [ ! -f "$BENCHMARK_JSON" ]; then
+        echo " Benchmark 失败：未在 output/ 下找到 benchmark_result_*.json"
         exit 1
     fi
     echo " Benchmark 完成！阈值已保存。"
@@ -56,9 +58,14 @@ run_inference() {
     echo ""
     echo " [Step 2] 正在运行 Inference 生成提交文件..."
     
-    if [ ! -f "$BENCHMARK_JSON" ]; then
-        echo " 错误: 找不到 $BENCHMARK_JSON，请先运行 Benchmark。"
-        exit 1
+    if [ -z "$BENCHMARK_JSON" ] || [ ! -f "$BENCHMARK_JSON" ]; then
+        # 兼容“仅 Inference”：尝试自动选择最新的 benchmark 结果
+        BENCHMARK_JSON=$(ls -1t output/benchmark_result_*.json 2>/dev/null | head -n 1)
+        if [ -z "$BENCHMARK_JSON" ] || [ ! -f "$BENCHMARK_JSON" ]; then
+            echo " 错误: 找不到 benchmark_result_*.json，请先运行 Benchmark。"
+            exit 1
+        fi
+        echo " [Info] 未指定 RUN_ID 对应的 JSON，已自动使用最新文件: $BENCHMARK_JSON"
     fi
     
     python inference.py \

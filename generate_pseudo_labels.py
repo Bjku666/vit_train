@@ -12,6 +12,7 @@ import os
 import argparse
 import shutil
 from typing import List
+import glob
 
 import torch
 from torch.utils.data import DataLoader
@@ -73,7 +74,17 @@ def ensure_output_dirs(base_dir: str):
 
 def main():
     args = parse_args()
-    models = load_models(args.model_paths)
+
+    # 支持通配符：与 benchmark_vit.py / inference.py 行为保持一致
+    model_files: List[str] = []
+    for pattern in args.model_paths:
+        model_files.extend(glob.glob(pattern))
+
+    if not model_files:
+        print(f"❌ Error: No model files found matching pattern(s): {args.model_paths}")
+        return
+
+    models = load_models(model_files)
 
     # 无标签集：MedImage-TestSet
     dataset = MedicalDataset(config.UNLABELED_TEST_DIR, mode='test', transform=val_transform_alb)

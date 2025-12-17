@@ -12,7 +12,22 @@ LOG_DIR = os.path.join(BASE_DIR, 'logs')
 
 # ===== RETFound 权重路径 =====
 # 指向本地 RETFound 权重文件（请确保文件存在且完整）
-RETFOUND_PATH = os.path.join(MODELS_DIR, 'RETFound_cfp_weights.pth')
+PRETRAINED_DIR = os.path.join(BASE_DIR, 'pretrained')
+RETFOUND_PATH = os.path.join(PRETRAINED_DIR, 'RETFound_cfp_weights.pth')
+
+# 其他预训练权重（如仍需使用 vit_base_384.bin）
+VIT_BASE_384_PATH = os.path.join(PRETRAINED_DIR, 'vit_base_384.bin')
+
+# 兼容旧路径：如果你仍然把权重放在 models/ 里，也能自动找到
+if not os.path.exists(RETFOUND_PATH):
+	_old_path = os.path.join(MODELS_DIR, 'RETFound_cfp_weights.pth')
+	if os.path.exists(_old_path):
+		RETFOUND_PATH = _old_path
+
+if not os.path.exists(VIT_BASE_384_PATH):
+	_old_path = os.path.join(MODELS_DIR, 'vit_base_384.bin')
+	if os.path.exists(_old_path):
+		VIT_BASE_384_PATH = _old_path
 
 # 1. 生成本次运行的唯一 ID
 RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -20,6 +35,7 @@ RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
 # 2. 目录配置
 CURRENT_RUN_MODELS_DIR = os.path.join(MODELS_DIR, f'run_{RUN_ID}')
 CURRENT_LOG_DIR = os.path.join(LOG_DIR, RUN_ID)
+# 训练文本日志放在 logs/ 目录
 TEXT_LOG_FILE = os.path.join(LOG_DIR, f'train_vit_{RUN_ID}.log')
 
 # === 修复：确保 OUTPUT_DIR 存在 ===
@@ -66,8 +82,8 @@ EPOCHS = 60  # 延长到 60 轮，配合预热与 EMA 稳定收敛
 
 # === 核心升级 1.1: 显存控制与梯度累积 ===
 # ViT-Large + 384 分辨率显存占用大，BatchSize 调小，通过 Accumulation 补回
-BATCH_SIZE = 8        # ⬇️ 调小：ViT-Large 显存占用大，8 是安全线
-ACCUM_STEPS = 8       # ⬆️ 调大：8 * 8 = 64，保持等效 Batch Size 不变
+BATCH_SIZE = 8        #  调小：ViT-Large 显存占用大，8 是安全线
+ACCUM_STEPS = 8       #  调大：8 * 8 = 64，保持等效 Batch Size 不变
 
 # === 学习率微调 ===
 # 大模型微调建议降低学习率，防止破坏预训练特征

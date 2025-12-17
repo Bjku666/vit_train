@@ -56,8 +56,11 @@ def main():
         print(f"  -> Loading {os.path.basename(path)}")
         m = get_model(config.MODEL_NAME, num_classes=config.NUM_CLASSES, pretrained=False)
         try:
-            # 加载权重字典
-            state_dict = torch.load(path, map_location=config.DEVICE, weights_only=True)
+            # 加载权重字典（兼容不同 torch 版本）
+            try:
+                state_dict = torch.load(path, map_location=config.DEVICE, weights_only=True)
+            except TypeError:
+                state_dict = torch.load(path, map_location=config.DEVICE)
             
             # === 核心修复: 智能处理 DataParallel 的 'module.' 前缀 ===
             # 如果 state_dict 的 key 是以 'module.' 开头，就创建一个新的字典去掉这个前缀
@@ -72,7 +75,7 @@ def main():
             m.eval()
             models.append(m)
         except Exception as e:
-            print(f"    L─❌ Error loading {os.path.basename(path)}: {e}. Skipping this model.")
+            print(f"    L─Error loading {os.path.basename(path)}: {e}. Skipping this model.")
             
     if not models:
         print("No models were loaded successfully. Aborting.")

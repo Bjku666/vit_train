@@ -2,17 +2,22 @@
 
 ## 环境说明
 - 主配置位于 `config.py`（路径、超参、训练目录开关 `CONFIG_INIT_DIRS`）。
+- 预训练权重目录：`pretrained/`（例如 `pretrained/RETFound_cfp_weights.pth`）。
 - 数据目录：`data/2-MedImage-TrainSet`（有标签训练集），`data/MedImage-TestSet`（无标签测试集），`data/pseudo_labeled_set`（伪标签输出）。
 - 设备：脚本自动检测多卡并使用 `DataParallel`（训练/推理/伪标签均支持）。
 
 ## 1) 训练（5 折，带 EMA/Albumentations/Warmup）
 后台训练示例：
 ```bash
-nohup python -u train_vit.py > logs/train.log 2>&1 &
+nohup python -u train_vit.py > train_launcher.log 2>&1 &
 ```
 TensorBoard 可视化：
 ```bash
 tensorboard --logdir logs --port 6006
+```
+或使用脚本启动（TensorBoard 日志仍在 `logs/`，监控输出写入 `monitor.log`）：
+```bash
+bash monitor.sh
 ```
 说明：
 - 训练数据由 `config.TRAIN_DIRS` 聚合（默认包含原始集 + 伪标签集）。

@@ -77,7 +77,10 @@ def main():
     for path in model_files:
         print(f"  -> Loading {os.path.basename(path)}")
         m = get_model(config.MODEL_NAME, num_classes=config.NUM_CLASSES, pretrained=False)
-        state_dict = torch.load(path, map_location=config.DEVICE, weights_only=True)
+        try:
+            state_dict = torch.load(path, map_location=config.DEVICE, weights_only=True)
+        except TypeError:
+            state_dict = torch.load(path, map_location=config.DEVICE)
         if list(state_dict.keys())[0].startswith('module.'):
             new_state_dict = {k[7:]: v for k, v in state_dict.items()}
             state_dict = new_state_dict

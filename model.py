@@ -25,11 +25,14 @@ def get_model(model_name, num_classes=2, pretrained=False):
     weight_path = config.RETFOUND_PATH
     if not os.path.exists(weight_path):
         print(f"❌ 错误: 找不到 RETFound 权重文件: {weight_path}")
-        print("请确保已下载 RETFound_cfp_weights.pth 并放入 models 目录。")
+        print("请确保已下载 RETFound_cfp_weights.pth 并放入项目根目录的 pretrained 目录。")
         raise FileNotFoundError("RETFound weights missing")
         
     print(f"[Model] 正在加载 RETFound 权重: {os.path.basename(weight_path)}")
-    checkpoint = torch.load(weight_path, map_location='cpu', weights_only=False)
+    try:
+        checkpoint = torch.load(weight_path, map_location='cpu', weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(weight_path, map_location='cpu')
     
     # 处理不同的权重格式 (有些是 {'model': ...}, 有些直接是 state_dict)
     checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint

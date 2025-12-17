@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     gpu_count = torch.cuda.device_count()
-    logger.info(f"🚀 启动训练 (384px + EMA + BenGraham) | GPU: {gpu_count}")
+    logger.info(f"启动训练 (384px + EMA + BenGraham) | GPU: {gpu_count}")
     logger.info(f"Batch Size: {config.BATCH_SIZE} | Accum Steps: {config.ACCUM_STEPS} (Equiv Batch: {config.BATCH_SIZE * config.ACCUM_STEPS})")
     
     # === 核心修复 1: 使用 Albumentations 专业级增强（替换 torchvision）===
@@ -111,8 +111,16 @@ def main():
             for step, (images, labels) in enumerate(pbar):
                 images, labels = images.to(config.DEVICE), labels.to(config.DEVICE)
 
+                # 仅在每个 epoch 的第一个 step 记录一次图片，避免日志过大
+                # 反归一化 (De-normalization) 以便人眼观看（假设 mean/std = 0.5）
+                global_step = epoch * len(train_loader) + step
+
                 if mixup_fn is not None:
                     images, labels = mixup_fn(images, labels)
+
+                if step == 0:
+                    img_vis = (images[:4].detach().cpu() * 0.5 + 0.5).clamp(0.0, 1.0)
+                    writer.add_images('Input/Batch_Sample', img_vis, global_step)
 
                 outputs = model(images)
                 
@@ -129,8 +137,6 @@ def main():
 
                 train_loss_accum += loss_val
                 # === 核心修复 2: 补全 Step 级别的日志 + 线性预热 ===
-                global_step = epoch * len(train_loader) + step
-
                 # 线性预热：step 级别从 0 -> BASE_LR
                 if global_step < warmup_steps:
                     warmup_lr = config.BASE_LR * (global_step + 1) / warmup_steps
