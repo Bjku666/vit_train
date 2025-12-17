@@ -95,14 +95,26 @@ MODEL_NAME = 'vit_large_patch16_384'
 # 二分类：使用 BCEWithLogitsLoss，因此模型输出维度为 1（logit），标签为 0/1 float。
 NUM_CLASSES = 1
 
+# === 动态参数配置 (根据阶段自动调整) ===
 if CURRENT_STAGE == 1:
+	# Stage 1: 384 分辨率
 	IMAGE_SIZE = 384
 	EPOCHS = 30
 	BASE_LR = 1e-5
+
+	# 显存配置 (384px)
+	# 单卡 4090 24G 通常可以稳定跑到 BS=8
+	BATCH_SIZE = 8
+	ACCUM_STEPS = 8		# 等效 BS = 8 * 8 = 64
 elif CURRENT_STAGE == 2:
+	# Stage 2: 512 分辨率 (显存压力显著增加)
 	IMAGE_SIZE = 512
 	EPOCHS = 10
 	BASE_LR = 2e-6
+
+	# 显存配置 (512px) - 建议调小 batch 防止 OOM
+	BATCH_SIZE = 4
+	ACCUM_STEPS = 16	# 等效 BS = 4 * 16 = 64
 else:
 	raise ValueError(f"CURRENT_STAGE 只能是 1 或 2，但得到 {CURRENT_STAGE}")
 IMG_MEAN = [0.5, 0.5, 0.5]
@@ -115,10 +127,8 @@ NUM_WORKERS = 16
 TRAIN_SPLIT = 0.85
 K_FOLDS = 5
 
-# === 核心升级 1.1: 显存控制与梯度累积 ===
-# ViT-Large + 384 分辨率显存占用大，BatchSize 调小，通过 Accumulation 补回
-BATCH_SIZE = 8        #  调小：ViT-Large 显存占用大，8 是安全线
-ACCUM_STEPS = 8       #  调大：8 * 8 = 64，保持等效 Batch Size 不变
+# === 显存与梯度累积 ===
+# BATCH_SIZE / ACCUM_STEPS 已在上方按 CURRENT_STAGE 动态指定。
 
 # === 学习率设置 ===
 # Stage1/Stage2 的 BASE_LR 已在上方按 CURRENT_STAGE 指定。

@@ -13,7 +13,7 @@ ls -1t models/ | grep "run_" | head -n 5
 echo "----------------------------------------"
 
 # --- 2. 交互式选择模型 ---
-read -p "请输入要使用的 RUN_ID (例如 20231217_153000): " RUN_ID
+read -p "请输入要使用的 RUN_ID (完整文件夹名后缀): " RUN_ID
 
 if [ -z "$RUN_ID" ]; then
     echo " 错误: RUN_ID 不能为空"
@@ -27,6 +27,16 @@ if [ ! -d "$MODEL_DIR" ]; then
     exit 1
 fi
 
+# --- 3. 交互式选择阶段 (分辨率对齐) ---
+echo "----------------------------------------"
+echo "请选择模型对应的训练阶段 (用于对齐分辨率):"
+echo "  1) Stage 1 (384) [默认]"
+echo "  2) Stage 2 (512)"
+read -p "请输入数字 [1-2]: " STAGE
+STAGE=${STAGE:-1}
+export CURRENT_STAGE="$STAGE"
+echo "已选择 Stage: $STAGE"
+
 # --- 3. 交互式选择阈值 ---
 # 伪标签的关键在于“宁缺毋滥”，所以默认值设得很高 (0.99)
 read -p "请输入置信度阈值 [默认 0.99]: " THRESHOLD
@@ -35,6 +45,7 @@ THRESHOLD=${THRESHOLD:-0.99}
 echo ""
 echo "     配置确认:"
 echo "   - 使用模型: $MODEL_DIR/vit_fold*.pth"
+echo "   - 分辨率阶段: Stage $CURRENT_STAGE"
 echo "   - 置信度阈值: $THRESHOLD"
 echo "   - 目标目录: data/pseudo_labeled_set (由 config.py 定义)"
 echo "----------------------------------------"

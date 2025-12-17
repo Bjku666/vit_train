@@ -2,7 +2,7 @@
 
 # --- 配置区 ---
 # 指定 GPU ID (例如 0, 1 或 0,1)
-GPU_ID="${GPU_ID:-0}"
+GPU_ID="${GPU_ID:-1}"
 export CUDA_VISIBLE_DEVICES=$GPU_ID
 
 # 确保日志目录存在
