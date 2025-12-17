@@ -4,58 +4,76 @@ import torch.nn as nn
 import os
 import config
 
-def get_model(model_name, num_classes=2, pretrained=True, drop_path_rate=0.1):
+def get_model(model_name, num_classes=2, pretrained=False):
     """
-    通用模型构建函数 (修正版):
-    - 优先加载本地权重。
-    - 自动处理分类头不匹配的问题 (迁移学习核心)。
+    RETFound 专用构建函数:
+    1. 创建 ViT-Large-384 骨架
+    2. 加载 RETFound-224 权重
+    3. 自动执行 Positional Embedding 插值 (224 -> 384)
     """
-    print(f"[Model] Creating {model_name} for {num_classes} classes...")
+    print(f"[Model] 初始化 RETFound (ViT-Large) for {num_classes} classes...")
     
-    # 1. 先创建我们自己任务的模型 (num_classes=2)
-    #    pretrained=False 确保它不会自己去联网下载
+    # 1. 创建骨架 (不加载 timm 的 ImageNet 权重)
     model = timm.create_model(
-        model_name,
+        config.MODEL_NAME,        # 'vit_large_patch16_384'
         pretrained=False,
         num_classes=num_classes,
-        drop_path_rate=drop_path_rate,
+        drop_path_rate=0.2,       # 增加一点 drop_path 防止过拟合
     )
     
-    # 定义本地权重路径
-    local_weight_path = os.path.join(config.MODELS_DIR, 'vit_base_384.bin')
+    # 2. 加载本地 RETFound 权重
+    weight_path = config.RETFOUND_PATH
+    if not os.path.exists(weight_path):
+        print(f"❌ 错误: 找不到 RETFound 权重文件: {weight_path}")
+        print("请确保已下载 RETFound_cfp_weights.pth 并放入 models 目录。")
+        raise FileNotFoundError("RETFound weights missing")
+        
+    print(f"[Model] 正在加载 RETFound 权重: {os.path.basename(weight_path)}")
+    checkpoint = torch.load(weight_path, map_location='cpu', weights_only=False)
     
-    # 2. 如果本地有权重文件，就加载它
-    if os.path.exists(local_weight_path):
-        print(f"[Info] Found local weights: {local_weight_path}, performing transfer learning...")
-        
-        # 加载预训练模型的 state_dict
-        state_dict = torch.load(local_weight_path, map_location='cpu')
+    # 处理不同的权重格式 (有些是 {'model': ...}, 有些直接是 state_dict)
+    checkpoint_model = checkpoint['model'] if 'model' in checkpoint else checkpoint
 
-        # 检查是否是 timm 的 checkpoint 格式
-        if 'model' in state_dict:
-            state_dict = state_dict['model']
+    # --- 核心黑魔法: 位置编码插值 (Interpolation) ---
+    # 解决 RETFound(224) -> 当前模型(384) 的尺寸不匹配问题
+    state_dict = model.state_dict()
+    pos_embed_key = 'pos_embed'
+    
+    if pos_embed_key in checkpoint_model:
+        pos_embed_checkpoint = checkpoint_model[pos_embed_key]
+        embedding_size = pos_embed_checkpoint.shape[-1]
+        num_extra_tokens = 1 # cls token
+        
+        # 计算原版 (224) 和 目标 (384) 的 grid size
+        # 224 / 16 = 14 (orig_size)
+        # 384 / 16 = 24 (new_size)
+        orig_size = int((pos_embed_checkpoint.shape[1] - num_extra_tokens) ** 0.5)
+        new_size = int((state_dict[pos_embed_key].shape[1] - num_extra_tokens) ** 0.5)
+        
+        if orig_size != new_size:
+            print(f"[Info] 执行位置编码插值: {orig_size}x{orig_size} -> {new_size}x{new_size}")
+            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+            
+            # Reshape -> Permute -> Interpolate -> Permute -> Flatten
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False
+            )
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+            
+            # 合并并更新权重
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+            checkpoint_model[pos_embed_key] = new_pos_embed
+    
+    # --- 移除不匹配的 Head ---
+    # RETFound 预训练时的分类头通常不匹配，直接丢弃
+    for k in list(checkpoint_model.keys()):
+        if 'head' in k or 'fc' in k:
+            del checkpoint_model[k]
 
-        # --- 核心修复：处理分类头不匹配 ---
-        # 1. 获取我们自己模型的 state_dict
-        model_dict = model.state_dict()
-        
-        # 2. 筛选出预训练模型中，除了分类头之外的所有权重
-        #    我们只加载那些 key 存在于我们模型中，并且尺寸也匹配的权重
-        pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
-        
-        # 3. 更新我们模型的权重
-        model_dict.update(pretrained_dict)
-        
-        # 4. 将更新后的权重加载回模型
-        #    strict=True 确保所有我们期望的权重都正确加载了
-        model.load_state_dict(model_dict, strict=True)
-        
-        print(f"[Success] Loaded {len(pretrained_dict)} matching layers from checkpoint.")
-        
-    elif pretrained:
-        # 如果没有本地文件，并且要求 pretrained=True，才尝试联网
-        print(f"[Warn] Local weights not found, trying to download from Hugging Face Hub...")
-        # 这里会利用 timm 的内置逻辑自动处理分类头
-        model = timm.create_model(model_name, pretrained=True, num_classes=num_classes)
+    # 3. 加载权重 (strict=False 允许忽略 head)
+    msg = model.load_state_dict(checkpoint_model, strict=False)
+    print(f"[Success] 权重加载完成。Missing keys (主要是head): {len(msg.missing_keys)}")
     
     return model

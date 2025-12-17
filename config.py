@@ -10,6 +10,10 @@ DATA_DIR = os.path.join(BASE_DIR, 'data')
 MODELS_DIR = os.path.join(BASE_DIR, 'models')
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
 
+# ===== RETFound 权重路径 =====
+# 指向本地 RETFound 权重文件（请确保文件存在且完整）
+RETFOUND_PATH = os.path.join(MODELS_DIR, 'RETFound_cfp_weights.pth')
+
 # 1. 生成本次运行的唯一 ID
 RUN_ID = datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -41,12 +45,13 @@ LABELED_TEST_DIR = os.path.join(DATA_DIR, '2-MedImage-TestSet')
 UNLABELED_TEST_DIR = os.path.join(DATA_DIR, 'MedImage-TestSet')
 
 # ===== 模型与训练参数 (升级版) =====
-# 使用支持 384 分辨率的权重
-MODEL_NAME = 'vit_base_patch16_384.augreg_in21k_ft_in1k'
+# 1) 切换到 ViT-Large (RETFound 底座)
+# 注意：这里只定义结构，权重由 model.py 手动加载
+MODEL_NAME = 'vit_large_patch16_384'
 NUM_CLASSES = 2
 
-# === 核心升级 1: 提升分辨率 ===
-IMAGE_SIZE = 384  
+# 2) 显存与分辨率适配 (针对 24G 显存优化)
+IMAGE_SIZE = 384
 IMG_MEAN = [0.5, 0.5, 0.5]
 IMG_STD = [0.5, 0.5, 0.5]
 
@@ -60,11 +65,13 @@ K_FOLDS = 5
 EPOCHS = 60  # 延长到 60 轮，配合预热与 EMA 稳定收敛
 
 # === 核心升级 1.1: 显存控制与梯度累积 ===
-# 384分辨率下显存占用大，BatchSize 调小，通过 Accumulation 补回
-BATCH_SIZE = 64       # 单次前向传播的图片数
-ACCUM_STEPS = 1       # 梯度累积步数 (等效 Batch Size = 16 * 2 = 32)
+# ViT-Large + 384 分辨率显存占用大，BatchSize 调小，通过 Accumulation 补回
+BATCH_SIZE = 8        # ⬇️ 调小：ViT-Large 显存占用大，8 是安全线
+ACCUM_STEPS = 8       # ⬆️ 调大：8 * 8 = 64，保持等效 Batch Size 不变
 
-BASE_LR = 1.5e-5        # 学习率下调，降低各 Fold 方差
+# === 学习率微调 ===
+# 大模型微调建议降低学习率，防止破坏预训练特征
+BASE_LR = 1e-5        # 原来是 1.5e-5
 WARMUP_EPOCHS = 10    # 新增线性预热轮数（按 step 级计算）
 WEIGHT_DECAY = 0.05
 CLIP_GRAD_NORM = 1.0
