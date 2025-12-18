@@ -15,7 +15,7 @@ except Exception:
 import config  # 导入配置以获取 target size
 
 def get_transforms():
-    """集中定义 train/val/test 变换，供 train/benchmark/inference 复用。"""
+    """集中定义 train/val/test 变换，供 train/inference 复用。"""
     if not _HAS_ALB:
         return None, None, None
 

@@ -1,58 +1,47 @@
-# ViT 训练 / 评测 / 推理 使用指南
+# vit_train (clean)
 
-## 环境说明
-- 主配置位于 `config.py`（路径、超参、训练目录开关 `CONFIG_INIT_DIRS`）。
-- 预训练权重目录：`pretrained/`（例如 `pretrained/RETFound_cfp_weights.pth`）。
-- 数据目录：`data/2-MedImage-TrainSet`（有标签训练集），`data/MedImage-TestSet`（无标签测试集）。
-- 设备：脚本自动检测多卡并使用 `DataParallel`（训练/推理均支持）。
+This repo supports **training + inference for unlabeled test submission**.
+- No pseudo-labeling
+- No local benchmark on labeled test
+- Model selection and threshold should be decided on your **validation split only**
 
-## 1) 训练（5 折，带 EMA/LLRD/冻结解冻/Albumentations/Warmup）
-后台训练示例：
+## 1) Data layout (default)
+- `data/2-MedImage-TrainSet/normal/*.jpg`
+- `data/2-MedImage-TrainSet/disease/*.jpg`
+- `data/MedImage-TestSet/*.jpg`  (unlabeled, for submission)
+
+## 2) Train
+Stage1 (low-res):
 ```bash
-nohup python -u train_vit.py > train_launcher.log 2>&1 &
-```
-TensorBoard 可视化：
-```bash
-tensorboard --logdir logs --port 6006
-```
-或使用脚本启动（TensorBoard 日志仍在 `logs/`，监控输出写入 `monitor.log`）：
-```bash
-bash monitor.sh
-```
-说明：
-- 训练数据由 `config.TRAIN_DIRS` 聚合（当前仅包含原始集）。
-- Stage2 默认启用 LLRD（`USE_LLRD`）、更高 base lr (`STAGE2_BASE_LR`)、冻结→解冻策略（`FREEZE_*`）。
-- EMA：`USE_EMA` 控制，权重保存在 `models/run_*/vit_foldX.pth`（优先保存 EMA）。
-
-## 2) 评测（Benchmark，多模型 TTA + 阈值搜索）
-```bash
-CONFIG_INIT_DIRS=0 SHIFT_TTA=1 SHIFT_PX=8 python benchmark_vit.py --model_paths "models/run_xxx/vit_fold*.pth"
-```
-输出：`output/benchmark_result_YYYYMMDD_HHMMSS.json`，包含最佳阈值、ACC、F1；可选平移 TTA（无旋转）。
-
-## 3) 推理提交（Inference，多模型 TTA）
-```bash
-CONFIG_INIT_DIRS=0 SHIFT_TTA=1 SHIFT_PX=8 python inference.py \
-    --model_paths "models/run_xxx/vit_fold*.pth" \
-    --benchmark_json output/benchmark_result_YYYYMMDD_HHMMSS.json
-```
-输出：`output/submission_YYYYMMDD_HHMMSS.csv`，使用固化阈值对无标签测试集预测；可选平移 TTA。
-
-## 4) 快速检查
-- 训练日志：`logs/<run_id>/fold_k/` (TensorBoard)；文本日志 `logs/train_vit_<run_id>.log`。
-- 模型权重：`models/run_<run_id>/vit_fold*.pth`。
-- 评测结果：`output/benchmark_result_*.json`。
-- 提交文件：`output/submission_*.csv`。
-
-
-## Download Swin pretrained weights
-
-Option A (recommended): let `timm` download automatically by using `pretrained=True`.
-
-Option B (manual):
-
-```bash
-cd pretrained
-./download_swin_weights.sh
+GPU_ID=0 RUN_ID=run_swin_01 STAGE=1 MODEL_NAME="swin_base_patch4_window12_384" ./train.sh
 ```
 
+Stage2 (high-res fine-tune, optional):
+```bash
+GPU_ID=0 RUN_ID=run_swin_01 STAGE=2 MODEL_NAME="swin_base_patch4_window12_384" ./train.sh
+```
+
+Notes:
+- Every epoch checkpoint is saved under `models/run_<RUN_ID>/`
+- Training writes `*_meta.json` with `best_thr` (computed on validation)
+
+## 3) TensorBoard
+```bash
+./monitor.sh
+```
+
+## 4) Submit (inference on unlabeled test only)
+Pick a specific epoch:
+```bash
+RUN_ID=run_swin_01 STAGE=2 SELECT="epoch:006" ./submit.sh
+```
+
+Or average the last K epochs:
+```bash
+RUN_ID=run_swin_01 STAGE=2 AVG_LAST_K=3 ./submit.sh
+```
+
+Override threshold (recommended if you choose it manually from validation):
+```bash
+RUN_ID=run_swin_01 STAGE=2 THRESHOLD=0.62 ./submit.sh
+```
