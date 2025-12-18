@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Submit script (no pseudo-labeling, no local benchmark).
+# Submit script.
 # It only runs inference on the **unlabeled** test set and writes submission csv.
 #
 # Usage:

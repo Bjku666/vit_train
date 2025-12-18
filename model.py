@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import config
+from collections import OrderedDict
 
 
 class GeM(nn.Module):
@@ -76,14 +77,29 @@ class TimmBinaryClassifier(nn.Module):
         self.head = nn.Linear(feat_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 大多数 timm 模型支持 forward_features
+        # 大多数 timm 模型支持 forward_features；个别模型可能返回 dict/tuple
         if hasattr(self.backbone, "forward_features"):
             feat = self.backbone.forward_features(x)
         else:
             feat = self.backbone(x)
-        # 部分模型返回 (B, C, H, W)，需要做池化
-        if feat.dim() == 4:
-            feat = feat.mean(dim=(-2, -1))
+
+        if isinstance(feat, dict):
+            feat = feat.get("x") or next(iter(feat.values()))
+        if isinstance(feat, (list, tuple)):
+            feat = feat[-1]
+        # 若返回特征图，兼容 NCHW 与 NHWC 两种布局
+        if isinstance(feat, torch.Tensor) and feat.dim() == 4:
+            C = self.head.in_features
+            if feat.shape[-1] == C:  # NHWC
+                feat = feat.mean(dim=(1, 2))
+            elif feat.shape[1] == C:  # NCHW
+                feat = feat.mean(dim=(-2, -1))
+            else:
+                # 回退：尝试将通道维移到最后再做空间平均
+                if feat.shape[1] < feat.shape[-1]:
+                    feat = feat.permute(0, 2, 3, 1).contiguous().mean(dim=(1, 2))
+                else:
+                    feat = feat.mean(dim=(-2, -1))
         out = self.head(feat)
         return out.squeeze(-1)
 
@@ -98,6 +114,27 @@ def _load_checkpoint(path: str) -> dict:
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         return ckpt["state_dict"]
     return ckpt
+
+
+def _match_and_filter_state_dict(module: nn.Module, state: dict) -> OrderedDict:
+    """根据模块当前参数形状过滤权重：
+    - 去除常见前缀（module./model./backbone.）
+    - 仅保留名称存在且形状一致的条目，避免 size mismatch 抛错
+    返回可安全加载的有序字典。
+    """
+    msd = module.state_dict()
+    out = OrderedDict()
+    for k, v in state.items():
+        k2 = k
+        if k2.startswith("module."):
+            k2 = k2[7:]
+        if k2.startswith("model."):
+            k2 = k2[6:]
+        if k2.startswith("backbone."):
+            k2 = k2[len("backbone."):]
+        if k2 in msd and msd[k2].shape == v.shape:
+            out[k2] = v
+    return out
 
 
 def _interpolate_pos_embed(vit: nn.Module, checkpoint_model: dict) -> dict:
@@ -158,17 +195,28 @@ def get_model() -> nn.Module:
     # Swin / ConvNeXt 等（默认 ImageNet 预训练）
     # -----------------------------
     if "swin" in name:
-        checkpoint_path = config.SWIN_CHECKPOINT_PATH if os.path.exists(config.SWIN_CHECKPOINT_PATH) else ""
-        use_pretrained = checkpoint_path == ""
-        # 构建去掉分类头的主干；若提供本地权重则不会尝试联网下载。
+        # 不再使用 timm 的 checkpoint_path（其内部为 strict 加载）。
+        # 当存在本地权重时：先构建未预训练的模型，再手动 strict=False 加载；
+        # 否则：使用 timm 的 ImageNet 预训练权重。
+        has_local = os.path.exists(config.SWIN_CHECKPOINT_PATH)
         backbone = timm.create_model(
             config.MODEL_NAME,
-            pretrained=use_pretrained,
+            pretrained=(not has_local),
             num_classes=0,
-            checkpoint_path=checkpoint_path,
+            global_pool="",
         )
+
+        src = "timm pretrained"
+        missing = unexpected = None
+        if has_local:
+            state = _load_checkpoint(config.SWIN_CHECKPOINT_PATH)
+            state = _match_and_filter_state_dict(backbone, state)
+            msg = backbone.load_state_dict(state, strict=False)
+            missing = len(getattr(msg, "missing_keys", []))
+            unexpected = len(getattr(msg, "unexpected_keys", []))
+            src = f"manual strict=False from {config.SWIN_CHECKPOINT_PATH} (loaded={len(state)})"
+
         model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
-        src = "timm pretrained" if use_pretrained else f"local ckpt: {checkpoint_path}"
         print(f"[Model] Swin backbone: {config.MODEL_NAME} | {src} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
         return model
 
@@ -177,7 +225,7 @@ def get_model() -> nn.Module:
     # -----------------------------
     if "vit" in name:
         # 创建不带分类头的 timm ViT 主干
-        backbone = timm.create_model(config.MODEL_NAME, pretrained=False, num_classes=0)
+        backbone = timm.create_model(config.MODEL_NAME, pretrained=False, num_classes=0, global_pool="")
         # 加载 RETFound 权重
         missing, unexpected = load_retfound_weights(backbone, config.RETFOUND_PATH)
 
@@ -190,7 +238,7 @@ def get_model() -> nn.Module:
         return model
 
     # 回退：任意 timm 模型
-    backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0)
+    backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0, global_pool="")
     model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
     print(f"[Model] timm backbone: {config.MODEL_NAME} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
     return model
