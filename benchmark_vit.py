@@ -24,12 +24,14 @@ os.environ['CONFIG_INIT_DIRS'] = '0'
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import config
 from model import get_model
-from dataset import MedicalDataset, val_transform_alb
+from dataset import MedicalDataset, get_transforms
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Final ViT Benchmark & Ensemble Script")
     parser.add_argument('--model_paths', nargs='+', required=True, 
                         help="Path to model files. Use quotes for wildcards, e.g., 'models/run_xxx/vit_fold*.pth'")
+    parser.add_argument('--image_size', type=int, default=None, help="Override image size for building model (avoid env CURRENT_STAGE mismatch)")
+    parser.add_argument('--stage', type=int, default=None, help="Optional stage tag for logging")
     return parser.parse_args()
 
 def tta_shift(images: torch.Tensor, shift_px: int):
@@ -49,6 +51,12 @@ def tta_shift(images: torch.Tensor, shift_px: int):
 
 def main():
     args = parse_args()
+
+    if args.stage is not None:
+        config.CURRENT_STAGE = args.stage
+    if args.image_size is not None and args.image_size != config.IMAGE_SIZE:
+        print(f"[Warn] Override IMAGE_SIZE from {config.IMAGE_SIZE} -> {args.image_size}")
+        config.IMAGE_SIZE = args.image_size
     
     model_files = []
     for path_pattern in args.model_paths:
@@ -58,10 +66,10 @@ def main():
         print(f"❌ Error: No model files found matching the pattern: {args.model_paths}")
         return
 
-    print(f"Found {len(model_files)} models for evaluation.")
+    print(f"Found {len(model_files)} models for evaluation. ImageSize={config.IMAGE_SIZE}")
 
     # 1. 准备数据（使用验证期同款归一化）
-    test_transform = val_transform_alb
+    _, test_transform = get_transforms()
     dataset = MedicalDataset(config.LABELED_TEST_DIR, mode='train', transform=test_transform)
     loader = DataLoader(dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=4)
 
@@ -111,8 +119,9 @@ def main():
             prob_sum = torch.zeros(images.size(0), device=config.DEVICE)
             tta_views = [images, torch.flip(images, dims=[3])]
             if shift_tta:
-                tta_views.extend(tta_shift(images, shift_px))
-                tta_views.extend([torch.flip(v, dims=[3]) for v in tta_views if v is not images])
+                shift_views = tta_shift(images, shift_px)
+                tta_views.extend(shift_views)
+                tta_views.extend([torch.flip(v, dims=[3]) for v in shift_views])
             denom = float(len(models) * len(tta_views))
             
             for model in models:

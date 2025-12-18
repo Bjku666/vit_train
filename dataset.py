@@ -9,23 +9,30 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import config  # 导入配置以获取 target size
 
-# === 专业级数据增强：Albumentations 版 ===
-# 说明：在 Ben Graham 预处理后进一步做几何与噪声扰动，缓解域偏移
-train_transform_alb = A.Compose([
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=20, p=0.7),
-    A.RandomBrightnessContrast(p=0.7),
-    A.GaussNoise(p=0.2),
-    A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ToTensorV2(),
-])
+def get_transforms():
+    """集中定义 train/val/test 变换，供 train/benchmark/inference 复用。"""
+    train_transform = A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.ShiftScaleRotate(
+            shift_limit=0.02,
+            scale_limit=0.05,
+            rotate_limit=10,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+            p=0.5,
+        ),
+        A.RandomBrightnessContrast(brightness_limit=0.10, contrast_limit=0.10, p=0.5),
+        A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=5, p=0.3),
+        A.Normalize(mean=config.IMG_MEAN, std=config.IMG_STD),
+        ToTensorV2(),
+    ])
 
-# 验证 / 测试仅做归一化，保持分布稳定
-val_transform_alb = A.Compose([
-    A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ToTensorV2(),
-])
+    val_transform = A.Compose([
+        A.Normalize(mean=config.IMG_MEAN, std=config.IMG_STD),
+        ToTensorV2(),
+    ])
+
+    return train_transform, val_transform
 
 def ben_graham_preprocessing(image, target_size=config.IMAGE_SIZE):
     """
@@ -118,23 +125,18 @@ class MedicalDataset(Dataset):
             image = Image.open(img_path).convert('RGB')
             
             # === 核心改动: 应用 Ben Graham 预处理 ===
-            # 这会把不同医院、不同光照的图统一成“橙色调、高对比度”的标准图
             image = ben_graham_preprocessing(image, target_size=config.IMAGE_SIZE)
-            # Albumentations 期望 numpy -> dict 输入
             img_np = np.array(image)
             if self.transform:
                 transformed = self.transform(image=img_np)
                 image = transformed["image"]
             else:
-                # 兜底：无增强时使用最简单的张量转换
                 image = transforms.ToTensor()(image)
 
-            # 标签处理
+            # 标签处理：严格用父目录名判断
             if self.mode in ['train', 'val']:
-                if 'disease' in img_path.lower():
-                    label = 1
-                else:
-                    label = 0
+                parent = os.path.basename(os.path.dirname(img_path)).lower()
+                label = 1 if parent == 'disease' else 0
                 return image, torch.tensor(label, dtype=torch.long)
             else:
                 filename = os.path.basename(img_path)
@@ -142,5 +144,4 @@ class MedicalDataset(Dataset):
                 
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
-            # 返回全黑图防止 Crash
             return torch.zeros(3, config.IMAGE_SIZE, config.IMAGE_SIZE), 0

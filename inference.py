@@ -19,7 +19,7 @@ os.environ['CONFIG_INIT_DIRS'] = '0'
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import config
 from model import get_model
-from dataset import MedicalDataset
+from dataset import MedicalDataset, get_transforms
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -38,15 +38,15 @@ def parse_args():
     # [关键] 仅评测模式开关
     parser.add_argument('--only_eval', action='store_true', 
                         help="If set, only search best threshold based on OOF and exit.")
+    parser.add_argument('--image_size', type=int, default=None, help="Override image size for building model (avoid env CURRENT_STAGE mismatch)")
+    parser.add_argument('--stage', type=int, default=None, help="Optional stage tag for logging")
                         
     return parser.parse_args()
 
 
 def build_test_transform():
-    return A.Compose([
-        A.Normalize(mean=config.IMG_MEAN, std=config.IMG_STD),
-        ToTensorV2(),
-    ])
+    _, val_t = get_transforms()
+    return val_t
 
 
 def load_oof(oof_paths):
@@ -156,6 +156,12 @@ def tta_shift(images: torch.Tensor, shift_px: int):
 
 def main():
     args = parse_args()
+
+    if args.stage is not None:
+        config.CURRENT_STAGE = args.stage
+    if args.image_size is not None and args.image_size != config.IMAGE_SIZE:
+        print(f"[Warn] Override IMAGE_SIZE from {config.IMAGE_SIZE} -> {args.image_size}")
+        config.IMAGE_SIZE = args.image_size
     
     # --- 1. 确定 OOF 文件 ---
     oof_files = []
@@ -239,8 +245,9 @@ def main():
             prob_sum = torch.zeros(images.size(0), device=config.DEVICE)
             tta_views = tta_2x(images)
             if shift_tta:
-                tta_views.extend(tta_shift(images, shift_px))
-                tta_views.extend([torch.flip(v, dims=[3]) for v in tta_views if v is not images])
+                shift_views = tta_shift(images, shift_px)
+                tta_views.extend(shift_views)
+                tta_views.extend([torch.flip(v, dims=[3]) for v in shift_views])
             denom = float(len(models) * len(tta_views))
 
             for model in models:

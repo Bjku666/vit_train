@@ -34,19 +34,11 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 import config
 from model import get_model
-from dataset import MedicalDataset
+from dataset import MedicalDataset, get_transforms
 
 
 def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: float, layer_decay: float) -> list[dict]:
-    """构建 LLRD 参数组。
-
-    规则：
-    - ViT backbone blocks 分层衰减：block i 的 lr = base_lr * layer_decay ** (num_layers-1-i)
-    - patch_embed / pos_embed 使用最小 lr（最深层）
-    - head 使用最大 lr（不衰减）
-    - no_decay：Norm、bias 不做 weight decay
-    - 兼容 DataParallel
-    """
+    """构建 LLRD 参数组（分层 × decay/no_decay 共 ~2*num_layers+2 组）。"""
 
     def _is_no_decay(n: str, p: nn.Parameter) -> bool:
         if not p.requires_grad:
@@ -57,75 +49,68 @@ def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: f
             return True
         return False
 
+    def _add(group_key: tuple[str, bool], lr: float, n: str, p: nn.Parameter):
+        if not p.requires_grad:
+            return
+        name, decay_flag = group_key
+        key = (name, decay_flag)
+        if key not in groups:
+            groups[key] = {
+                'params': [],
+                'lr': lr,
+                'weight_decay': 0.0 if not decay_flag else weight_decay,
+                'group_name': f"{name}_{'decay' if decay_flag else 'nodecay'}",
+            }
+        groups[key]['params'].append(p)
+
     model_ref = model.module if isinstance(model, nn.DataParallel) else model
     backbone = getattr(model_ref, 'backbone', None)
     head = getattr(model_ref, 'head', None)
     if backbone is None or head is None:
         raise RuntimeError('模型缺少 backbone 或 head，无法应用 LLRD')
 
-    # backbone blocks
     blocks = getattr(backbone, 'blocks', None)
     if blocks is None:
         raise RuntimeError('backbone.blocks 不存在，无法应用 LLRD')
     num_layers = len(blocks)
 
-    # 收集参数
-    param_groups = []
+    groups: dict[tuple[str, bool], dict] = {}
 
-    # patch_embed / pos_embed -> 最小 lr
     min_lr = base_lr * (layer_decay ** (num_layers - 1)) if num_layers > 0 else base_lr
-    for name, module in [('patch_embed', getattr(backbone, 'patch_embed', None)), ('pos_embed', getattr(backbone, 'pos_embed', None))]:
+
+    # patch_embed / pos_embed
+    for name, module in [('patch_embed', getattr(backbone, 'patch_embed', None))]:
         if module is None:
             continue
-        for n, p in (module.named_parameters() if hasattr(module, 'named_parameters') else [(name, module)]):
-            if not p.requires_grad:
-                continue
-            group = {
-                'params': [p],
-                'lr': min_lr,
-                'weight_decay': 0.0 if _is_no_decay(n, p) else weight_decay,
-            }
-            param_groups.append(group)
+        for n, p in module.named_parameters():
+            decay_flag = not _is_no_decay(n, p)
+            _add(('embed', decay_flag), min_lr, n, p)
+    if hasattr(backbone, 'pos_embed') and isinstance(backbone.pos_embed, torch.nn.Parameter):
+        decay_flag = not _is_no_decay('pos_embed', backbone.pos_embed)
+        _add(('embed', decay_flag), min_lr, 'pos_embed', backbone.pos_embed)
 
     # blocks 分层衰减
     for i, block in enumerate(blocks):
         layer_lr = base_lr * (layer_decay ** (num_layers - 1 - i))
         for n, p in block.named_parameters():
-            if not p.requires_grad:
-                continue
-            group = {
-                'params': [p],
-                'lr': layer_lr,
-                'weight_decay': 0.0 if _is_no_decay(n, p) else weight_decay,
-            }
-            param_groups.append(group)
+            decay_flag = not _is_no_decay(n, p)
+            _add((f'block_{i}', decay_flag), layer_lr, n, p)
 
-    # backbone.norm (若存在) 使用最小 lr
+    # backbone.norm
     if hasattr(backbone, 'norm'):
         for n, p in backbone.norm.named_parameters():
-            if not p.requires_grad:
-                continue
-            param_groups.append({
-                'params': [p],
-                'lr': min_lr,
-                'weight_decay': 0.0 if _is_no_decay(n, p) else weight_decay,
-            })
+            decay_flag = not _is_no_decay(n, p)
+            _add(('backbone_norm', decay_flag), min_lr, n, p)
 
-    # head 不衰减，使用 base_lr（最大 lr）
-    max_lr = base_lr
+    # head（最大 lr）
     for n, p in head.named_parameters():
-        if not p.requires_grad:
-            continue
-        param_groups.append({
-            'params': [p],
-            'lr': max_lr,
-            'weight_decay': 0.0 if _is_no_decay(n, p) else weight_decay,
-        })
+        decay_flag = not _is_no_decay(n, p)
+        _add(('head', decay_flag), base_lr, n, p)
 
-    return param_groups
+    return list(groups.values())
 
 
-def _apply_mixup(images: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _apply_mixup(images: torch.Tensor, labels: torch.Tensor, epoch: int) -> tuple[torch.Tensor, torch.Tensor]:
     """对一个 batch 做标准 Mixup。
 
     说明：
@@ -134,7 +119,14 @@ def _apply_mixup(images: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tens
     """
     if not getattr(config, 'USE_MIXUP', False):
         return images, labels
+
+    # Stage2: 降低强度并在末尾关闭
     prob = float(getattr(config, 'MIXUP_PROB', 1.0))
+    if config.CURRENT_STAGE == 2:
+        prob = float(getattr(config, 'MIXUP_PROB_STAGE2', prob))
+        disable_last = int(getattr(config, 'MIXUP_DISABLE_LAST_EPOCHS', 0))
+        if disable_last > 0 and epoch >= config.EPOCHS - disable_last:
+            prob = 0.0
     if prob <= 0.0 or np.random.rand() > prob:
         return images, labels
 
@@ -150,6 +142,12 @@ def _apply_mixup(images: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tens
     labels = labels.view(-1)
     mixed_labels = labels.mul(lam).add(labels[index].mul(1.0 - lam))
     return mixed_images, mixed_labels
+
+
+def _lr_stats(optimizer: optim.Optimizer) -> tuple[float, float, float]:
+    lrs = [g['lr'] for g in optimizer.param_groups]
+    head_lr = next((g['lr'] for g in optimizer.param_groups if g.get('group_name', '').startswith('head')), lrs[0] if lrs else 0.0)
+    return (min(lrs) if lrs else 0.0, max(lrs) if lrs else 0.0, head_lr)
 
 
 def _search_best_threshold_from_oof(oof_paths: list[str]) -> tuple[float, float]:
@@ -259,37 +257,6 @@ def _write_stage1_meta(tb_fold_dir: str, global_step_end: int) -> None:
         json.dump({'global_step_end': int(global_step_end)}, f, ensure_ascii=False, indent=2)
 
 
-def build_transforms():
-    """按要求使用“保守”增强。
-
-    关键原则：
-    - 青光眼判别高度依赖视盘/视杯形态与边界细节，强几何增强（尤其弹性形变）会破坏结构。
-    - 只做轻微 Shift/Scale/Rotate + 颜色扰动 + 水平翻转，提升鲁棒性但不扭曲关键解剖结构。
-    """
-    train_transform = A.Compose([
-        A.HorizontalFlip(p=0.5),
-        A.ShiftScaleRotate(
-            shift_limit=0.02,
-            scale_limit=0.05,
-            rotate_limit=10,
-            border_mode=cv2.BORDER_CONSTANT,
-            value=0,
-            p=0.5,
-        ),
-        A.RandomBrightnessContrast(brightness_limit=0.10, contrast_limit=0.10, p=0.5),
-        A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=5, p=0.3),
-        A.Normalize(mean=config.IMG_MEAN, std=config.IMG_STD),
-        ToTensorV2(),
-    ])
-
-    val_transform = A.Compose([
-        A.Normalize(mean=config.IMG_MEAN, std=config.IMG_STD),
-        ToTensorV2(),
-    ])
-
-    return train_transform, val_transform
-
-
 def main():
     args = parse_args()
 
@@ -299,7 +266,7 @@ def main():
     logger.info(f"LR={config.BASE_LR} | Epochs={config.EPOCHS}")
     logger.info(f"RUN_ID={config.RUN_ID} | TB LogDir={config.CURRENT_LOG_DIR}")
 
-    train_transform, val_transform = build_transforms()
+    train_transform, val_transform = get_transforms()
 
     full_dataset = MedicalDataset(config.TRAIN_DIRS, mode='train', transform=None)
     all_paths = full_dataset.image_paths
@@ -414,7 +381,8 @@ def main():
             optimizer = optim.AdamW(model.parameters(), lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
             logger.info(f"[Optimizer] AdamW 单组 | lr={config.BASE_LR:.2e}")
 
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=config.BASE_LR * 0.1)
+        # eta_min 按组比例缩放：设为 0 避免抬高低层 lr
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=0.0)
 
         # ===== EMA =====
         ema = None
@@ -468,7 +436,7 @@ def main():
                 labels = labels.to(config.DEVICE).float().view(-1)
 
                 # ===== Mixup 强正则化（按你的 Checklist 强制开启） =====
-                images, labels = _apply_mixup(images, labels)
+                images, labels = _apply_mixup(images, labels, epoch)
 
                 # 仅在每个 epoch 的第一个 step 记录一次图片，避免日志过大
                 # 反归一化 (De-normalization) 以便人眼观看（假设 mean/std = 0.5）
@@ -492,10 +460,13 @@ def main():
 
                 # TensorBoard（step 级）
                 global_step = step_offset + epoch * len(train_loader) + step
+                min_lr_step, max_lr_step, head_lr_step = _lr_stats(optimizer)
                 writer.add_scalar('Loss/train_step', loss_val, global_step)
-                writer.add_scalar('LR', optimizer.param_groups[0]['lr'], global_step)
+                writer.add_scalar('LR/min', min_lr_step, global_step)
+                writer.add_scalar('LR/max', max_lr_step, global_step)
+                writer.add_scalar('LR/head', head_lr_step, global_step)
 
-                pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
+                pbar.set_postfix(loss=f"{loss_val:.4f}", lr_max=f"{max_lr_step:.2e}", lr_head=f"{head_lr_step:.2e}")
             
             model.eval()
 
@@ -565,11 +536,16 @@ def main():
             writer.add_scalar('FN/val@0.5', fn50, epoch_end_step)
             writer.add_scalar('FP/val@bestT', fpbt, epoch_end_step)
             writer.add_scalar('FN/val@bestT', fnbt, epoch_end_step)
+            min_lr_epoch, max_lr_epoch, head_lr_epoch = _lr_stats(optimizer)
+            writer.add_scalar('LR/min_epoch', min_lr_epoch, epoch_end_step)
+            writer.add_scalar('LR/max_epoch', max_lr_epoch, epoch_end_step)
+            writer.add_scalar('LR/head_epoch', head_lr_epoch, epoch_end_step)
 
             logger.info(
                 f"Epoch {epoch+1:02d} | TrainLoss={avg_train_loss:.4f} | ValLoss={avg_val_loss:.4f} | "
                 f"ValAcc@0.5={acc50:.4f} | ValAcc@bestT={accbt:.4f} | bestT={best_t_epoch:.3f} | "
-                f"FP@0.5={fp50} FN@0.5={fn50} | FP@bestT={fpbt} FN@bestT={fnbt}"
+                f"FP@0.5={fp50} FN@0.5={fn50} | FP@bestT={fpbt} FN@bestT={fnbt} | "
+                f"LR[min/max/head]={min_lr_epoch:.2e}/{max_lr_epoch:.2e}/{head_lr_epoch:.2e}"
             )
 
             # 每个 epoch 后走一步 scheduler（按 epoch 维度）
