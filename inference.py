@@ -69,7 +69,7 @@ def load_model_from_ckpt(ckpt_path: str) -> torch.nn.Module:
 def predict_probs(models: List[torch.nn.Module], loader: DataLoader, tta: bool = True):
     filenames = []
     probs_out = []
-    for batch in tqdm(loader, desc="Infer", leave=False):
+    for batch in tqdm(loader, desc="推理", leave=False):
         images, names = batch
         images = images.to(config.DEVICE, non_blocking=True)
 
@@ -92,14 +92,14 @@ def predict_probs(models: List[torch.nn.Module], loader: DataLoader, tta: bool =
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path/dir/glob. Default: current run dir.")
-    parser.add_argument("--pattern", type=str, default="*_stage2_*.pth", help="Glob pattern within ckpt dir.")
+    parser.add_argument("--ckpt", type=str, default="", help="权重路径/目录/通配（默认：当前运行目录）")
+    parser.add_argument("--pattern", type=str, default="*_stage2_*.pth", help="在目录内匹配的通配模式")
     parser.add_argument("--select", type=str, default="best", help="best | last | epoch:NNN")
-    parser.add_argument("--avg_last_k", type=int, default=0, help="Average last K epoch checkpoints.")
-    parser.add_argument("--threshold", type=float, default=None, help="Override threshold.")
-    parser.add_argument("--threshold_json", type=str, default="", help="JSON containing best_threshold.")
-    parser.add_argument("--no_tta", action="store_true")
-    parser.add_argument("--output_csv", type=str, default="", help="Output csv path.")
+    parser.add_argument("--avg_last_k", type=int, default=0, help="对最后 K 个 epoch 权重做均值")
+    parser.add_argument("--threshold", type=float, default=None, help="手动覆盖阈值")
+    parser.add_argument("--threshold_json", type=str, default="", help="包含 best_threshold 的 JSON 文件")
+    parser.add_argument("--no_tta", action="store_true", help="关闭 TTA")
+    parser.add_argument("--output_csv", type=str, default="", help="输出 CSV 路径")
     args = parser.parse_args()
 
     thr = 0.5
@@ -125,8 +125,8 @@ def main():
     out_csv = args.output_csv or os.path.join(config.OUTPUT_DIR, f"submission_{config.RUN_ID}.csv")
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     df.to_csv(out_csv, index=False)
-    print(f"saved: {out_csv}")
-    print(f"ckpts: {len(ckpts)} thr={thr:.3f} tta={not args.no_tta}")
+    print(f"已保存: {out_csv}")
+    print(f"权重数: {len(ckpts)} 阈值={thr:.3f} TTA={not args.no_tta}")
 
 
 if __name__ == "__main__":

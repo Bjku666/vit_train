@@ -204,7 +204,19 @@ def get_model() -> nn.Module:
             pretrained=(not has_local),
             num_classes=0,
             global_pool="",
+            img_size=config.IMAGE_SIZE,  # 确保 patch_embed/grid_size 与当前阶段分辨率一致
         )
+
+        # 允许可变输入尺寸（Stage2 可能使用 448/512）
+        try:
+            if hasattr(backbone, "patch_embed"):
+                backbone.patch_embed.strict_img_size = False
+        except Exception:
+            pass
+        try:
+            setattr(backbone, "dynamic_img_size", True)
+        except Exception:
+            pass
 
         src = "timm pretrained"
         missing = unexpected = None
@@ -226,6 +238,22 @@ def get_model() -> nn.Module:
     if "vit" in name:
         # 创建不带分类头的 timm ViT 主干
         backbone = timm.create_model(config.MODEL_NAME, pretrained=False, num_classes=0, global_pool="")
+
+        # 允许可变输入尺寸（Stage2 可能使用 448/512）
+        try:
+            if hasattr(backbone, "patch_embed"):
+                backbone.patch_embed.strict_img_size = False
+        except Exception:
+            pass
+        try:
+            setattr(backbone, "dynamic_img_size", True)
+        except Exception:
+            pass
+        try:
+            if hasattr(backbone, "patch_embed"):
+                backbone.patch_embed.img_size = None
+        except Exception:
+            pass
         # 加载 RETFound 权重
         missing, unexpected = load_retfound_weights(backbone, config.RETFOUND_PATH)
 
@@ -239,6 +267,22 @@ def get_model() -> nn.Module:
 
     # 回退：任意 timm 模型
     backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0, global_pool="")
+
+    # 允许可变输入尺寸（Stage2 可能使用 448/512）
+    try:
+        if hasattr(backbone, "patch_embed"):
+            backbone.patch_embed.strict_img_size = False
+    except Exception:
+        pass
+    try:
+        setattr(backbone, "dynamic_img_size", True)
+    except Exception:
+        pass
+    try:
+        if hasattr(backbone, "patch_embed"):
+            backbone.patch_embed.img_size = None
+    except Exception:
+        pass
     model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
     print(f"[Model] timm backbone: {config.MODEL_NAME} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
     return model

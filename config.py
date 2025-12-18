@@ -121,10 +121,11 @@ if CURRENT_STAGE == 1:
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 else:
-    IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "512"))
-    EPOCHS = int(os.environ.get("EPOCHS", "8"))
-    # 第二阶段更偏向微调
-    BASE_LR = float(os.environ.get("BASE_LR", "1e-5"))
+    # Swin window=12, patch=4 => 输入尺寸需被 48 整除；默认改为 480 以避免 assert。
+    IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "480"))
+    EPOCHS = int(os.environ.get("EPOCHS", "5"))
+    # 第二阶段短训微调
+    BASE_LR = float(os.environ.get("BASE_LR", "5e-6"))
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.1"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
 
