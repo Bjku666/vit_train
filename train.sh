@@ -1,61 +1,68 @@
 #!/bin/bash
+set -e
 
-# --- 配置区 ---
-# 指定 GPU ID (例如 0, 1 或 0,1)
-GPU_ID="${GPU_ID:-1}"
-export CUDA_VISIBLE_DEVICES=$GPU_ID
+# Usage examples:
+#   GPU_ID=0 MODEL_NAME="swin_base_patch4_window12_384" STAGE=1 RUN_ID=run1 ./train.sh
+#   GPU_ID=0 MODEL_NAME="swin_base_patch4_window12_384" STAGE=2 RUN_ID=run1 INIT_CKPT="models/run_run1/..._stage1_best.pth" ./train.sh
 
-# 确保日志目录存在
-mkdir -p logs
+GPU_ID="${GPU_ID:-0}"
+export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 STAGE="${STAGE:-1}"
-export CURRENT_STAGE="$STAGE"
+export CURRENT_STAGE="${STAGE}"
 
-# 可选：手动指定 RUN_ID 以实现 Stage1/Stage2 TensorBoard 无缝衔接
-# 示例：
-#   RUN_ID=20251217_120000 STAGE=1 ./train.sh
-#   RUN_ID=20251217_120000 STAGE=2 ./train.sh
-if [ -n "${RUN_ID:-}" ]; then
-	export RUN_ID
+# Use same RUN_ID across stages if you want stage2 to share the same output folder
+if [ -n "$RUN_ID" ]; then
+  export RUN_ID="$RUN_ID"
 fi
 
-# 默认不启用伪标签（你当前不需要这一步）
-export USE_PSEUDO_LABELS="${USE_PSEUDO_LABELS:-0}"
+# Default to Swin; override if needed
+export MODEL_NAME="${MODEL_NAME:-swin_base_patch4_window12_384}"
 
-STAGE1_MODELS_DIR="${STAGE1_MODELS_DIR:-}"
+# Default: single split
+export USE_KFOLD="${USE_KFOLD:-0}"
 
-# 若 Stage2 且你指定了 RUN_ID，但没显式给 Stage1 模型目录，则默认使用同一 run 目录
-if [ "$CURRENT_STAGE" = "2" ] && [ -z "$STAGE1_MODELS_DIR" ] && [ -n "${RUN_ID:-}" ]; then
-	STAGE1_MODELS_DIR="models/run_${RUN_ID}"
-fi
+mkdir -p logs
 
-echo "[ViT-Classification] 启动 5-Fold 训练 (Progressive Resizing)..."
-echo "使用的 GPU: $GPU_ID"
-echo "Stage: $CURRENT_STAGE | USE_PSEUDO_LABELS=$USE_PSEUDO_LABELS"
-if [ -n "${RUN_ID:-}" ]; then
-	echo "RUN_ID: $RUN_ID"
-fi
-if [ "$CURRENT_STAGE" = "2" ] && [ -n "$STAGE1_MODELS_DIR" ]; then
-	echo "Stage1 模型目录: $STAGE1_MODELS_DIR"
-fi
+LOG_FILE="logs/train_${RUN_ID:-auto}_stage${STAGE}.log"
 
-LOG_FILE="./train_stage${CURRENT_STAGE}.log"
-echo "日志将写入: $LOG_FILE"
-
-# --- 核心命令 ---
-# 1. nohup: 后台运行，关闭终端不退出
-# 2. python -u: 禁用输出缓冲，让日志实时写入
-# 3. > ./...: 重定向 stdout 和 stderr 到文件
-# 4. &: 放入后台
 EXTRA_ARGS=""
-if [ "$CURRENT_STAGE" = "2" ] && [ -n "$STAGE1_MODELS_DIR" ]; then
-	EXTRA_ARGS="--stage1_models_dir $STAGE1_MODELS_DIR"
+
+# Stage2 warm start
+if [ "$STAGE" = "2" ]; then
+  # If user passed INIT_CKPT, use it
+  if [ -n "$INIT_CKPT" ]; then
+    EXTRA_ARGS="--init_ckpt ${INIT_CKPT}"
+  else
+    # Try auto-detect from same run folder
+    if [ -n "$RUN_ID" ] && [ -d "models/run_${RUN_ID}" ]; then
+      CAND=$(ls -1 models/run_${RUN_ID}/*_stage1_*_best.pth 2>/dev/null | head -n 1 || true)
+      if [ -z "$CAND" ]; then
+        CAND=$(ls -1 models/run_${RUN_ID}/*_stage1_*_epoch*.pth 2>/dev/null | tail -n 1 || true)
+      fi
+      if [ -n "$CAND" ]; then
+        EXTRA_ARGS="--init_ckpt ${CAND}"
+        echo "[Auto] init_ckpt => ${CAND}"
+      else
+        echo "[Warn] No stage1 checkpoint found for warm-start. Training stage2 from scratch."
+      fi
+    fi
+  fi
 fi
 
-nohup python -u train_vit.py $EXTRA_ARGS > "$LOG_FILE" 2>&1 &
+echo "========================================"
+echo "Training"
+echo "  GPU_ID      : ${GPU_ID}"
+echo "  STAGE       : ${STAGE}"
+echo "  RUN_ID      : ${RUN_ID:-auto}"
+echo "  MODEL_NAME  : ${MODEL_NAME}"
+echo "  USE_KFOLD   : ${USE_KFOLD}"
+echo "  EXTRA_ARGS  : ${EXTRA_ARGS}"
+echo "  LOG_FILE    : ${LOG_FILE}"
+echo "========================================"
 
+nohup python -u train_vit.py ${EXTRA_ARGS} > "${LOG_FILE}" 2>&1 &
 PID=$!
-echo "任务已启动！PID: $PID"
-echo "正在追踪日志 (按 Ctrl+C 退出追踪，训练会继续)..."
-echo "---------------------------------------------------"
-tail -f "$LOG_FILE"
+echo "Started. PID=${PID}"
+echo "tail -f ${LOG_FILE}"
+tail -f "${LOG_FILE}"

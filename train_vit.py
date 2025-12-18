@@ -1,610 +1,589 @@
 """train_vit.py
 
-青光眼二分类冠军级训练脚本（按你的策略重构）：
-1) Progressive Resizing 两阶段训练：由 config.CURRENT_STAGE 控制（384 -> 512）
-2) Loss: BCEWithLogitsLoss（输出单 logit，后续用 OOF 搜索最佳阈值最大化 Accuracy）
-3) 保守数据增强：只做轻微颜色扰动+轻微几何+水平翻转，避免引入结构性几何失真
-4) Stage2 自动 warm-start：加载 Stage1 对应 fold 的最优权重
-5) OOF 保存：每折保存验证集 Preds/Targets 到 oof_fold_X.csv，用于阈值搜索
+Single-split (default) + optional KFold training script.
+
+Goals for this repo (your current strategy):
+- Binary classification (0/1), leaderboard metric = Accuracy
+- Support Swin (recommended) and RETFound-ViT backbones
+- Stage1/Stage2 progressive resizing via config.CURRENT_STAGE
+- "Non-best epoch can work better": save checkpoints every epoch + allow easy selection later
+- Optional: LLRD + freeze->unfreeze for Stage2 stability
 """
 
 import argparse
 import json
-import os
-import sys
 import logging
-import glob
+import os
+import random
+import shutil
+from dataclasses import asdict, dataclass
+from glob import glob
+from typing import Dict, List, Tuple
 
-import cv2
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
-from timm.utils import ModelEmaV2
-
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 import config
-from model import get_model
 from dataset import MedicalDataset, get_transforms
+from model import get_model
 
 
-def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: float, layer_decay: float) -> list[dict]:
-    """构建 LLRD 参数组（分层 × decay/no_decay 共 ~2*num_layers+2 组）。"""
+# -----------------------------
+# Utils
+# -----------------------------
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
 
-    def _is_no_decay(n: str, p: nn.Parameter) -> bool:
-        if not p.requires_grad:
-            return True
-        if n.endswith('.bias'):
-            return True
-        if 'norm' in n.lower() or 'bn' in n.lower():
-            return True
-        return False
 
-    def _add(group_key: tuple[str, bool], lr: float, n: str, p: nn.Parameter):
-        if not p.requires_grad:
-            return
-        name, decay_flag = group_key
-        key = (name, decay_flag)
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1 / (1 + np.exp(-x))
+
+
+def search_best_threshold(probs: np.ndarray, labels: np.ndarray) -> Tuple[float, float]:
+    """Return (best_thr, best_acc)."""
+    best_thr, best_acc = 0.5, -1.0
+    # coarse->fine search
+    for thr in np.linspace(0.2, 0.8, 121):
+        pred = (probs >= thr).astype(np.int64)
+        acc = (pred == labels).mean()
+        if acc > best_acc:
+            best_acc, best_thr = acc, float(thr)
+    return best_thr, float(best_acc)
+
+
+def confusion_from_probs(probs: np.ndarray, labels: np.ndarray, thr: float) -> Tuple[int, int, int, int]:
+    pred = (probs >= thr).astype(np.int64)
+    tn = int(((pred == 0) & (labels == 0)).sum())
+    fp = int(((pred == 1) & (labels == 0)).sum())
+    fn = int(((pred == 0) & (labels == 1)).sum())
+    tp = int(((pred == 1) & (labels == 1)).sum())
+    return tn, fp, fn, tp
+
+
+def gather_image_paths_and_labels(root_dirs) -> Tuple[List[str], List[int]]:
+    """Scan dirs for images. Label is determined by parent folder name: disease=1, else 0."""
+    if isinstance(root_dirs, (list, tuple)):
+        roots = root_dirs
+    else:
+        roots = [root_dirs]
+
+    paths = []
+    labels = []
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    for rd in roots:
+        for root, _, files in os.walk(rd):
+            for f in files:
+                if f.lower().endswith(exts):
+                    p = os.path.join(root, f)
+                    parent = os.path.basename(os.path.dirname(p)).lower()
+                    y = 1 if parent == "disease" else 0
+                    paths.append(p)
+                    labels.append(y)
+    # stable ordering
+    order = np.argsort(paths)
+    paths = [paths[i] for i in order]
+    labels = [labels[i] for i in order]
+    return paths, labels
+
+
+# -----------------------------
+# LLRD (supports ViT blocks / Swin layers.blocks)
+# -----------------------------
+def _is_no_decay(name: str, p: nn.Parameter) -> bool:
+    if not p.requires_grad:
+        return True
+    if name.endswith(".bias"):
+        return True
+    lname = name.lower()
+    if "norm" in lname or "bn" in lname or "layernorm" in lname:
+        return True
+    return False
+
+
+def _get_backbone_and_head(model: nn.Module) -> Tuple[nn.Module, nn.Module]:
+    m = model.module if isinstance(model, nn.DataParallel) else model
+    if not hasattr(m, "backbone") or not hasattr(m, "head"):
+        raise RuntimeError("Model must have .backbone and .head for LLRD/freeze")
+    return m.backbone, m.head
+
+
+def _build_block_id_map_for_swin(backbone: nn.Module) -> Tuple[Dict[Tuple[int, int], int], int]:
+    """Map (stage, block) -> global_id; return (map, total_blocks)."""
+    mapping: Dict[Tuple[int, int], int] = {}
+    gid = 0
+    layers = getattr(backbone, "layers", None)
+    if layers is None:
+        return mapping, 0
+    for s, layer in enumerate(layers):
+        blocks = getattr(layer, "blocks", None)
+        if blocks is None:
+            continue
+        for b in range(len(blocks)):
+            mapping[(s, b)] = gid
+            gid += 1
+    return mapping, gid
+
+
+def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: float, layer_decay: float) -> List[Dict]:
+    """Create param groups for LLRD.
+
+    - For ViT: backbone.blocks.{i}
+    - For Swin: backbone.layers.{stage}.blocks.{block}
+    """
+    backbone, head = _get_backbone_and_head(model)
+
+    # Detect ViT
+    vit_blocks = getattr(backbone, "blocks", None)
+    is_vit = vit_blocks is not None
+
+    # Detect Swin
+    swin_layers = getattr(backbone, "layers", None)
+    is_swin = (not is_vit) and (swin_layers is not None)
+
+    # Count layers (flattened blocks)
+    if is_vit:
+        num_layers = len(vit_blocks)
+        def layer_id_from_name(n: str) -> int:
+            if "backbone.blocks." in n:
+                try:
+                    return int(n.split("backbone.blocks.")[1].split(".")[0])
+                except Exception:
+                    return -1
+            return -1
+    elif is_swin:
+        mapping, num_layers = _build_block_id_map_for_swin(backbone)
+        def layer_id_from_name(n: str) -> int:
+            # backbone.layers.{s}.blocks.{b}
+            if "backbone.layers." in n and ".blocks." in n:
+                try:
+                    part = n.split("backbone.layers.")[1]
+                    s = int(part.split(".")[0])
+                    b = int(part.split(".blocks.")[1].split(".")[0])
+                    return mapping.get((s, b), -1)
+                except Exception:
+                    return -1
+            return -1
+    else:
+        # fallback: no LLRD, single group
+        return [{"params": [p for p in model.parameters() if p.requires_grad], "lr": base_lr, "weight_decay": weight_decay}]
+
+    groups: Dict[Tuple[int, bool], Dict] = {}
+
+    def add_param(layer_id: int, no_decay: bool, p: nn.Parameter, lr: float):
+        key = (layer_id, no_decay)
         if key not in groups:
             groups[key] = {
-                'params': [],
-                'lr': lr,
-                'weight_decay': 0.0 if not decay_flag else weight_decay,
-                'group_name': f"{name}_{'decay' if decay_flag else 'nodecay'}",
+                "params": [],
+                "lr": lr,
+                "weight_decay": 0.0 if no_decay else weight_decay,
             }
-        groups[key]['params'].append(p)
+        groups[key]["params"].append(p)
 
-    model_ref = model.module if isinstance(model, nn.DataParallel) else model
-    backbone = getattr(model_ref, 'backbone', None)
-    head = getattr(model_ref, 'head', None)
-    if backbone is None or head is None:
-        raise RuntimeError('模型缺少 backbone 或 head，无法应用 LLRD')
-
-    blocks = getattr(backbone, 'blocks', None)
-    if blocks is None:
-        raise RuntimeError('backbone.blocks 不存在，无法应用 LLRD')
-    num_layers = len(blocks)
-
-    groups: dict[tuple[str, bool], dict] = {}
-
-    min_lr = base_lr * (layer_decay ** (num_layers - 1)) if num_layers > 0 else base_lr
-
-    # patch_embed / pos_embed
-    for name, module in [('patch_embed', getattr(backbone, 'patch_embed', None))]:
-        if module is None:
+    # Assign params
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
             continue
-        for n, p in module.named_parameters():
-            decay_flag = not _is_no_decay(n, p)
-            _add(('embed', decay_flag), min_lr, n, p)
-    if hasattr(backbone, 'pos_embed') and isinstance(backbone.pos_embed, torch.nn.Parameter):
-        decay_flag = not _is_no_decay('pos_embed', backbone.pos_embed)
-        _add(('embed', decay_flag), min_lr, 'pos_embed', backbone.pos_embed)
+        no_decay = _is_no_decay(n, p)
 
-    # blocks 分层衰减
-    for i, block in enumerate(blocks):
-        layer_lr = base_lr * (layer_decay ** (num_layers - 1 - i))
-        for n, p in block.named_parameters():
-            decay_flag = not _is_no_decay(n, p)
-            _add((f'block_{i}', decay_flag), layer_lr, n, p)
+        # head: always max lr
+        if n.startswith("head.") or ".head." in n:
+            add_param(num_layers - 1, no_decay, p, base_lr)
+            continue
 
-    # backbone.norm
-    if hasattr(backbone, 'norm'):
-        for n, p in backbone.norm.named_parameters():
-            decay_flag = not _is_no_decay(n, p)
-            _add(('backbone_norm', decay_flag), min_lr, n, p)
+        lid = layer_id_from_name(n)
+        if lid >= 0 and num_layers > 0:
+            scale = layer_decay ** (num_layers - 1 - lid)
+            add_param(lid, no_decay, p, base_lr * scale)
+        else:
+            # embeddings / patch_embed / pos_embed get the smallest lr
+            scale = layer_decay ** num_layers
+            add_param(-1, no_decay, p, base_lr * scale)
 
-    # head（最大 lr）
-    for n, p in head.named_parameters():
-        decay_flag = not _is_no_decay(n, p)
-        _add(('head', decay_flag), base_lr, n, p)
+    # Print min/max lr for sanity
+    lrs = [g["lr"] for g in groups.values()]
+    if len(lrs) > 0:
+        print(f"[LLRD] param_groups={len(groups)} min_lr={min(lrs):.2e} max_lr={max(lrs):.2e}")
 
     return list(groups.values())
 
 
-def _apply_mixup(images: torch.Tensor, labels: torch.Tensor, epoch: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """对一个 batch 做标准 Mixup。
-
-    说明：
-    - 二分类 BCEWithLogitsLoss 下，label 是 float (0/1)，mixup 后仍是 float。
-    - 这里只实现 Mixup（不做 CutMix/旋转），严格按你的正则化要求“止血”。
-    """
-    if not getattr(config, 'USE_MIXUP', False):
-        return images, labels
-
-    # Stage2: 降低强度并在末尾关闭
-    prob = float(getattr(config, 'MIXUP_PROB', 1.0))
-    if config.CURRENT_STAGE == 2:
-        prob = float(getattr(config, 'MIXUP_PROB_STAGE2', prob))
-        disable_last = int(getattr(config, 'MIXUP_DISABLE_LAST_EPOCHS', 0))
-        if disable_last > 0 and epoch >= config.EPOCHS - disable_last:
-            prob = 0.0
-    if prob <= 0.0 or np.random.rand() > prob:
-        return images, labels
-
-    alpha = float(getattr(config, 'MIXUP_ALPHA', 0.8))
-    if alpha <= 0.0:
-        return images, labels
-
-    lam = float(np.random.beta(alpha, alpha))
-    batch_size = images.size(0)
-    index = torch.randperm(batch_size, device=images.device)
-
-    mixed_images = images.mul(lam).add(images[index].mul(1.0 - lam))
-    labels = labels.view(-1)
-    mixed_labels = labels.mul(lam).add(labels[index].mul(1.0 - lam))
-    return mixed_images, mixed_labels
+# -----------------------------
+# Freeze utilities
+# -----------------------------
+def set_requires_grad(module: nn.Module, flag: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad = flag
 
 
-def _lr_stats(optimizer: optim.Optimizer) -> tuple[float, float, float]:
-    lrs = [g['lr'] for g in optimizer.param_groups]
-    head_lr = next((g['lr'] for g in optimizer.param_groups if g.get('group_name', '').startswith('head')), lrs[0] if lrs else 0.0)
-    return (min(lrs) if lrs else 0.0, max(lrs) if lrs else 0.0, head_lr)
+def apply_stage2_freeze(model: nn.Module) -> None:
+    """Freeze early layers for stage2 warm-start."""
+    backbone, _ = _get_backbone_and_head(model)
 
+    # Freeze patch embed (both ViT and Swin expose patch_embed in timm)
+    if config.FREEZE_PATCH_EMBED_STAGE2 and hasattr(backbone, "patch_embed"):
+        set_requires_grad(backbone.patch_embed, False)
 
-def _search_best_threshold_from_oof(oof_paths: list[str]) -> tuple[float, float]:
-    """从 OOF 文件搜索全局最佳 Accuracy 阈值（与 inference 对齐：0.2~0.8，步长 0.001）。"""
-    if not oof_paths:
-        return 0.5, -1.0
-
-    probs_all: list[np.ndarray] = []
-    targets_all: list[np.ndarray] = []
-    for p in oof_paths:
-        df = pd.read_csv(p)
-        if 'Preds' not in df.columns or 'Targets' not in df.columns:
-            continue
-        probs_all.append(df['Preds'].values.astype(np.float32))
-        targets_all.append(df['Targets'].values.astype(np.int64))
-
-    if not probs_all:
-        return 0.5, -1.0
-
-    probs = np.concatenate(probs_all, axis=0)
-    targets = np.concatenate(targets_all, axis=0)
-
-    thresholds = np.linspace(0.2, 0.8, 601, dtype=np.float32)
-    best_t = 0.5
-    best_acc = -1.0
-    for t in thresholds:
-        preds = (probs >= t).astype(np.int64)
-        acc = float((preds == targets).mean())
-        if acc > best_acc or (acc == best_acc and float(t) < best_t):
-            best_acc = acc
-            best_t = float(t)
-    return best_t, best_acc
-
-
-def _interpolate_pos_embed_in_state_dict(state_dict: dict, key: str, target_shape: torch.Size) -> None:
-    """将 state_dict[key] 的 ViT pos_embed 插值到目标形状。
-
-    用途：Stage2 需要加载 Stage1 权重，但 Stage1(384) 的 pos_embed 网格是 24x24，
-    Stage2(512) 是 32x32；必须插值，否则无法 strict load 或者特征错位。
-    """
-    if key not in state_dict:
+    # ViT blocks
+    if hasattr(backbone, "blocks"):
+        blocks = backbone.blocks
+        n_freeze = min(config.FREEZE_BLOCKS_BEFORE_STAGE2, len(blocks))
+        for i in range(n_freeze):
+            set_requires_grad(blocks[i], False)
+        print(f"[Freeze] ViT: froze patch_embed={config.FREEZE_PATCH_EMBED_STAGE2}, blocks[:{n_freeze}]")
         return
 
-    pos_embed = state_dict[key]
-    if not isinstance(pos_embed, torch.Tensor):
-        return
-    if tuple(pos_embed.shape) == tuple(target_shape):
-        return
-
-    # 形状约定：(1, 1+N, D)
-    if pos_embed.ndim != 3:
-        return
-
-    num_extra_tokens = 1
-    embedding_size = pos_embed.shape[-1]
-
-    n_old = pos_embed.shape[1] - num_extra_tokens
-    n_new = target_shape[1] - num_extra_tokens
-    old_size = int((n_old) ** 0.5)
-    new_size = int((n_new) ** 0.5)
-    if old_size * old_size != n_old or new_size * new_size != n_new:
+    # Swin layers.blocks (freeze by flattened block index)
+    if hasattr(backbone, "layers"):
+        mapping, total = _build_block_id_map_for_swin(backbone)
+        n_freeze = min(config.FREEZE_BLOCKS_BEFORE_STAGE2, total)
+        # freeze blocks with gid < n_freeze
+        for (s, b), gid in mapping.items():
+            if gid < n_freeze:
+                set_requires_grad(backbone.layers[s].blocks[b], False)
+        print(f"[Freeze] Swin: froze patch_embed={config.FREEZE_PATCH_EMBED_STAGE2}, first {n_freeze}/{total} blocks")
         return
 
-    extra_tokens = pos_embed[:, :num_extra_tokens]
-    pos_tokens = pos_embed[:, num_extra_tokens:]
-    pos_tokens = pos_tokens.reshape(-1, old_size, old_size, embedding_size).permute(0, 3, 1, 2)
-    pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-    pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-    state_dict[key] = torch.cat((extra_tokens, pos_tokens), dim=1)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(config.TEXT_LOG_FILE, mode='w'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+def unfreeze_all(model: nn.Module) -> None:
+    backbone, head = _get_backbone_and_head(model)
+    set_requires_grad(backbone, True)
+    set_requires_grad(head, True)
+    print("[Freeze] Unfroze all parameters")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description='RETFound+GeM Training (Binary)')
-    # Stage2 时从 Stage1 warm-start 的模型目录（可覆盖 config.STAGE1_MODELS_DIR）
-    parser.add_argument('--stage1_models_dir', type=str, default='', help='Stage1 模型目录（包含 vit_stage1_fold{X}.pth 或 vit_fold{X}.pth）')
-    return parser.parse_args()
+# -----------------------------
+# Train / eval loops
+# -----------------------------
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: str) -> Tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    all_probs = []
+    all_y = []
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.numpy().astype(np.int64)
+        logits = model(images).detach().float().cpu().numpy()
+        probs = sigmoid_np(logits)
+        all_probs.append(probs)
+        all_y.append(labels)
+    return np.concatenate(all_probs), np.concatenate(all_y)
 
 
-def _read_stage1_step_offset(tb_fold_dir: str) -> int:
-    """读取 Stage1 的全局步数末尾，用于让 Stage2 的 TensorBoard 曲线接着画。"""
-    meta_path = os.path.join(tb_fold_dir, 'meta_stage1.json')
-    if not os.path.exists(meta_path):
-        return 0
-    try:
-        with open(meta_path, 'r', encoding='utf-8') as f:
-            meta = json.load(f)
-        end_step = int(meta.get('global_step_end', -1))
-        return max(end_step + 1, 0)
-    except Exception:
-        return 0
+def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer, criterion, device: str, epoch: int) -> float:
+    model.train()
+    running = 0.0
+    optimizer.zero_grad(set_to_none=True)
+
+    use_mixup = config.USE_MIXUP and (config.CURRENT_STAGE == 1 or epoch < (config.EPOCHS - config.MIXUP_DISABLE_LAST_EPOCHS))
+    for step, (images, labels) in enumerate(tqdm(loader, desc=f"Train e{epoch}", leave=False)):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True).float()
+
+        # Optional mixup (binary soft labels)
+        if use_mixup and np.random.rand() < config.MIXUP_PROB:
+            lam = np.random.beta(config.MIXUP_ALPHA, config.MIXUP_ALPHA)
+            index = torch.randperm(images.size(0), device=images.device)
+            images = lam * images + (1 - lam) * images[index]
+            labels = lam * labels + (1 - lam) * labels[index]
+
+        logits = model(images)
+        loss = criterion(logits, labels)
+
+        loss = loss / config.ACCUM_STEPS
+        loss.backward()
+
+        if (step + 1) % config.ACCUM_STEPS == 0:
+            nn.utils.clip_grad_norm_(model.parameters(), config.CLIP_GRAD_NORM)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        running += loss.item() * config.ACCUM_STEPS
+
+    return running / max(1, len(loader))
 
 
-def _write_stage1_meta(tb_fold_dir: str, global_step_end: int) -> None:
-    os.makedirs(tb_fold_dir, exist_ok=True)
-    meta_path = os.path.join(tb_fold_dir, 'meta_stage1.json')
-    with open(meta_path, 'w', encoding='utf-8') as f:
-        json.dump({'global_step_end': int(global_step_end)}, f, ensure_ascii=False, indent=2)
+def save_checkpoint(path: str, model: nn.Module, epoch: int, extra: dict) -> None:
+    m = model.module if isinstance(model, nn.DataParallel) else model
+    ckpt = {
+        "epoch": epoch,
+        "model_name": config.MODEL_NAME,
+        "image_size": config.IMAGE_SIZE,
+        "stage": config.CURRENT_STAGE,
+        "state_dict": m.state_dict(),
+        "extra": extra,
+    }
+    torch.save(ckpt, path)
+
+
+def maybe_prune_old_ckpts(ckpt_dir: str, prefix: str) -> None:
+    if config.KEEP_LAST_N_EPOCHS >= 999:
+        return
+    paths = sorted(glob(os.path.join(ckpt_dir, f"{prefix}_epoch*.pth")))
+    if len(paths) <= config.KEEP_LAST_N_EPOCHS:
+        return
+    for p in paths[:-config.KEEP_LAST_N_EPOCHS]:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
+def run_single_split(init_ckpt: str = "") -> None:
+    set_seed(config.SEED)
+    ensure_dir(config.CURRENT_RUN_MODELS_DIR)
+    ensure_dir(config.CURRENT_LOG_DIR)
+
+    # Logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[
+            logging.FileHandler(config.TEXT_LOG_FILE, mode="a", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+    logger = logging.getLogger("train")
+
+    writer = SummaryWriter(log_dir=config.CURRENT_LOG_DIR)
+
+    # Build dataset list + split
+    all_paths, all_labels = gather_image_paths_and_labels(config.TRAIN_DIRS)
+    y = np.array(all_labels)
+
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=config.VAL_RATIO, random_state=config.SEED)
+    train_idx, val_idx = next(sss.split(np.zeros_like(y), y))
+
+    train_tf, val_tf, _ = get_transforms()
+    ds_train = MedicalDataset(root_dir=config.TRAIN_DIRS, mode="train", transform=train_tf, indices=train_idx, image_paths=all_paths)
+    ds_val = MedicalDataset(root_dir=config.TRAIN_DIRS, mode="val", transform=val_tf, indices=val_idx, image_paths=all_paths)
+
+    dl_train = DataLoader(ds_train, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True, drop_last=True)
+    dl_val = DataLoader(ds_val, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True)
+
+    # Model
+    model = get_model().to(config.DEVICE)
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+
+    # Optional warm-start
+    if init_ckpt:
+        logger.info(f"[Init] Loading init checkpoint: {init_ckpt}")
+        ckpt = torch.load(init_ckpt, map_location="cpu")
+        sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
+        msg = (model.module if isinstance(model, nn.DataParallel) else model).load_state_dict(sd, strict=False)
+        logger.info(f"[Init] missing={len(getattr(msg,'missing_keys',[]))} unexpected={len(getattr(msg,'unexpected_keys',[]))}")
+
+    # Stage2 freeze
+    if config.CURRENT_STAGE == 2 and config.FREEZE_EPOCHS_STAGE2 > 0:
+        apply_stage2_freeze(model)
+
+    criterion = nn.BCEWithLogitsLoss()
+
+    if config.USE_LLRD:
+        param_groups = get_optimizer_param_groups(model, base_lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY, layer_decay=config.LAYER_DECAY)
+        optimizer = optim.AdamW(param_groups)
+    else:
+        optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
+
+    # Scheduler: cosine WITHOUT global eta_min (works with LLRD)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=0.0)
+
+    best_val_acc = -1.0
+    best_epoch = -1
+    best_thr = 0.5
+
+    prefix = f"{config.MODEL_NAME.replace('/','_')}_stage{config.CURRENT_STAGE}"
+
+    for epoch in range(config.EPOCHS):
+        # Unfreeze after freeze epochs
+        if config.CURRENT_STAGE == 2 and epoch == config.FREEZE_EPOCHS_STAGE2:
+            unfreeze_all(model)
+
+            # rebuild optimizer param groups now that more params require_grad
+            if config.USE_LLRD:
+                param_groups = get_optimizer_param_groups(model, base_lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY, layer_decay=config.LAYER_DECAY)
+                optimizer = optim.AdamW(param_groups)
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=(config.EPOCHS - epoch), eta_min=0.0)
+
+        train_loss = train_one_epoch(model, dl_train, optimizer, criterion, config.DEVICE, epoch)
+
+        probs, labels = evaluate(model, dl_val, config.DEVICE)
+        thr, acc = search_best_threshold(probs, labels)
+        tn, fp, fn, tp = confusion_from_probs(probs, labels, thr)
+
+        # log
+        writer.add_scalar("loss/train", train_loss, epoch)
+        writer.add_scalar("acc/val_bestT", acc, epoch)
+        writer.add_scalar("thr/val_bestT", thr, epoch)
+        writer.add_scalar("fp/val_bestT", fp, epoch)
+        writer.add_scalar("fn/val_bestT", fn, epoch)
+
+        # also log min/max lr
+        lrs = [g["lr"] for g in optimizer.param_groups]
+        writer.add_scalar("lr/min", float(min(lrs)), epoch)
+        writer.add_scalar("lr/max", float(max(lrs)), epoch)
+
+        logger.info(f"[Epoch {epoch:03d}] loss={train_loss:.4f} val_acc@bestT={acc:.4f} bestT={thr:.3f} CM=[[{tn} {fp}] [{fn} {tp}]] lr=[{min(lrs):.2e},{max(lrs):.2e}]")
+
+        # Save every epoch (so you can choose "non-best")
+        if config.SAVE_EVERY_EPOCH:
+            ckpt_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f"{prefix}_epoch{epoch:03d}.pth")
+            save_checkpoint(ckpt_path, model, epoch, extra={"val_acc_bestT": acc, "val_thr": thr, "cm": [tn, fp, fn, tp]})
+            maybe_prune_old_ckpts(config.CURRENT_RUN_MODELS_DIR, prefix)
+
+        # Track best on val (still useful)
+        if acc > best_val_acc:
+            best_val_acc = acc
+            best_epoch = epoch
+            best_thr = thr
+            best_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f"{prefix}_best.pth")
+            save_checkpoint(best_path, model, epoch, extra={"val_acc_bestT": acc, "val_thr": thr, "cm": [tn, fp, fn, tp]})
+            logger.info(f"[Best] epoch={epoch} val_acc@bestT={acc:.4f} saved => {best_path}")
+
+        scheduler.step()
+
+    # Save final metadata json
+    meta = {
+        "run_id": config.RUN_ID,
+        "model_name": config.MODEL_NAME,
+        "stage": config.CURRENT_STAGE,
+        "image_size": config.IMAGE_SIZE,
+        "val_ratio": config.VAL_RATIO,
+        "seed": config.SEED,
+        "best_epoch": best_epoch,
+        "best_val_acc": float(best_val_acc),
+        "best_thr": float(best_thr),
+        "ckpt_prefix": prefix,
+    }
+    with open(os.path.join(config.CURRENT_RUN_MODELS_DIR, f"{prefix}_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"[Done] best_epoch={best_epoch} best_val_acc={best_val_acc:.4f} best_thr={best_thr:.3f}")
+    writer.close()
+
+
+def run_kfold(stage1_models_dir: str = "") -> None:
+    """Optional: keep your old KFold pathway."""
+    set_seed(config.SEED)
+    ensure_dir(config.CURRENT_RUN_MODELS_DIR)
+    ensure_dir(config.CURRENT_LOG_DIR)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[
+            logging.FileHandler(config.TEXT_LOG_FILE, mode="a", encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+    logger = logging.getLogger("train")
+
+    writer = SummaryWriter(log_dir=config.CURRENT_LOG_DIR)
+
+    all_paths, all_labels = gather_image_paths_and_labels(config.TRAIN_DIRS)
+    y = np.array(all_labels)
+
+    skf = StratifiedKFold(n_splits=config.N_SPLITS, shuffle=True, random_state=config.SEED)
+    train_tf, val_tf, _ = get_transforms()
+
+    prefix = f"{config.MODEL_NAME.replace('/','_')}_stage{config.CURRENT_STAGE}"
+
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(np.zeros_like(y), y), start=1):
+        logger.info(f"========== Fold {fold}/{config.N_SPLITS} ==========")
+
+        ds_train = MedicalDataset(root_dir=config.TRAIN_DIRS, mode="train", transform=train_tf, indices=tr_idx, image_paths=all_paths)
+        ds_val = MedicalDataset(root_dir=config.TRAIN_DIRS, mode="val", transform=val_tf, indices=va_idx, image_paths=all_paths)
+
+        dl_train = DataLoader(ds_train, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True, drop_last=True)
+        dl_val = DataLoader(ds_val, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True)
+
+        model = get_model().to(config.DEVICE)
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+
+        # stage2 warm-start: load stage1 fold best
+        if config.CURRENT_STAGE == 2 and stage1_models_dir:
+            cand = os.path.join(stage1_models_dir, f"{prefix}_fold{fold}_best.pth")
+            if os.path.exists(cand):
+                ckpt = torch.load(cand, map_location="cpu")
+                sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
+                (model.module if isinstance(model, nn.DataParallel) else model).load_state_dict(sd, strict=False)
+                logger.info(f"[Init] loaded stage1 fold ckpt: {cand}")
+
+        criterion = nn.BCEWithLogitsLoss()
+        if config.USE_LLRD:
+            param_groups = get_optimizer_param_groups(model, base_lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY, layer_decay=config.LAYER_DECAY)
+            optimizer = optim.AdamW(param_groups)
+        else:
+            optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
+
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=0.0)
+
+        best_val_acc = -1.0
+        best_epoch = -1
+        best_thr = 0.5
+
+        for epoch in range(config.EPOCHS):
+            if config.CURRENT_STAGE == 2 and config.FREEZE_EPOCHS_STAGE2 > 0 and epoch == 0:
+                apply_stage2_freeze(model)
+            if config.CURRENT_STAGE == 2 and epoch == config.FREEZE_EPOCHS_STAGE2:
+                unfreeze_all(model)
+
+            train_loss = train_one_epoch(model, dl_train, optimizer, criterion, config.DEVICE, epoch)
+            probs, labels = evaluate(model, dl_val, config.DEVICE)
+            thr, acc = search_best_threshold(probs, labels)
+            tn, fp, fn, tp = confusion_from_probs(probs, labels, thr)
+
+            writer.add_scalar(f"fold{fold}/loss", train_loss, epoch)
+            writer.add_scalar(f"fold{fold}/acc_bestT", acc, epoch)
+            writer.add_scalar(f"fold{fold}/thr_bestT", thr, epoch)
+
+            logger.info(f"[Fold {fold} e{epoch:03d}] loss={train_loss:.4f} val_acc@bestT={acc:.4f} bestT={thr:.3f} CM=[[{tn} {fp}] [{fn} {tp}]]")
+
+            if config.SAVE_EVERY_EPOCH:
+                ckpt_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f"{prefix}_fold{fold}_epoch{epoch:03d}.pth")
+                save_checkpoint(ckpt_path, model, epoch, extra={"fold": fold, "val_acc_bestT": acc, "val_thr": thr, "cm": [tn, fp, fn, tp]})
+
+            if acc > best_val_acc:
+                best_val_acc = acc
+                best_epoch = epoch
+                best_thr = thr
+                best_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f"{prefix}_fold{fold}_best.pth")
+                save_checkpoint(best_path, model, epoch, extra={"fold": fold, "val_acc_bestT": acc, "val_thr": thr, "cm": [tn, fp, fn, tp]})
+
+            scheduler.step()
+
+        logger.info(f"[Fold {fold}] best_epoch={best_epoch} best_acc={best_val_acc:.4f} best_thr={best_thr:.3f}")
+
+    writer.close()
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--init_ckpt", type=str, default="", help="Warm-start checkpoint path (single-split).")
+    parser.add_argument("--stage1_models_dir", type=str, default="", help="Stage1 models dir (kfold stage2 warm-start).")
+    args = parser.parse_args()
 
-    gpu_count = torch.cuda.device_count()
-    logger.info(f"启动训练 | Stage={config.CURRENT_STAGE} | Image={config.IMAGE_SIZE} | GPU={gpu_count}")
-    logger.info(f"Batch={config.BATCH_SIZE} | Accum={config.ACCUM_STEPS} | EquivBatch={config.BATCH_SIZE * config.ACCUM_STEPS}")
-    logger.info(f"LR={config.BASE_LR} | Epochs={config.EPOCHS}")
-    logger.info(f"RUN_ID={config.RUN_ID} | TB LogDir={config.CURRENT_LOG_DIR}")
+    if config.USE_KFOLD:
+        run_kfold(stage1_models_dir=args.stage1_models_dir)
+    else:
+        run_single_split(init_ckpt=args.init_ckpt)
 
-    train_transform, val_transform = get_transforms()
 
-    full_dataset = MedicalDataset(config.TRAIN_DIRS, mode='train', transform=None)
-    all_paths = full_dataset.image_paths
-    all_labels = [1 if 'disease' in p.lower() else 0 for p in all_paths]
-    skf = StratifiedKFold(n_splits=config.K_FOLDS, shuffle=True, random_state=config.SEED)
-
-    # 二分类：logits + BCEWithLogitsLoss
-    criterion = nn.BCEWithLogitsLoss()
-
-    for fold, (train_idx, val_idx) in enumerate(skf.split(all_paths, all_labels)):
-        fold_idx = fold + 1
-        logger.info(f"\n===== Fold {fold_idx}/{config.K_FOLDS} =====")
-
-        # TensorBoard：同一个 RUN_ID 下，fold 写到固定目录。
-        # 如果 Stage2 复用同一个 RUN_ID，则会在同一条曲线上继续追加 step。
-        tb_fold_dir = os.path.join(config.CURRENT_LOG_DIR, f'fold_{fold_idx}')
-        writer = SummaryWriter(log_dir=tb_fold_dir)
-        step_offset = _read_stage1_step_offset(tb_fold_dir) if config.CURRENT_STAGE == 2 else 0
-
-        train_ds = MedicalDataset(config.TRAIN_DIRS, mode='train', transform=train_transform, indices=train_idx, image_paths=all_paths)
-        val_ds = MedicalDataset(config.TRAIN_DIRS, mode='val', transform=val_transform, indices=val_idx, image_paths=all_paths)
-
-        train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True, 
-                                  num_workers=config.NUM_WORKERS, pin_memory=True, drop_last=True)
-        val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False, 
-                                num_workers=config.NUM_WORKERS, pin_memory=True)
-
-        model = get_model(config.MODEL_NAME, num_classes=config.NUM_CLASSES).to(config.DEVICE)
-
-        # Stage2：自动加载 Stage1 对应 fold 权重作为初始化
-        if config.CURRENT_STAGE == 2:
-            stage1_dir = (args.stage1_models_dir or config.STAGE1_MODELS_DIR).strip()
-            if stage1_dir:
-                stage1_path_a = os.path.join(stage1_dir, f'vit_stage1_fold{fold_idx}.pth')
-                stage1_path_b = os.path.join(stage1_dir, f'vit_fold{fold_idx}.pth')
-                stage1_path = stage1_path_a if os.path.exists(stage1_path_a) else stage1_path_b
-
-                if os.path.exists(stage1_path):
-                    logger.info(f"[Stage2] 加载 Stage1 权重初始化: {stage1_path}")
-                    try:
-                        state_dict = torch.load(stage1_path, map_location='cpu', weights_only=False)
-                    except TypeError:
-                        state_dict = torch.load(stage1_path, map_location='cpu')
-                    # 兼容历史上保存了 DataParallel 的 module. 前缀
-                    if isinstance(state_dict, dict) and state_dict and next(iter(state_dict.keys())).startswith('module.'):
-                        state_dict = {k[7:]: v for k, v in state_dict.items()}
-
-                    # 关键：pos_embed 插值 (Stage1 384 -> Stage2 512)
-                    model_for_keys = model  # 这里尚未 DataParallel
-                    target_pos_shape = model_for_keys.backbone.pos_embed.shape
-                    _interpolate_pos_embed_in_state_dict(state_dict, 'backbone.pos_embed', target_pos_shape)
-
-                    # 权重健康检查（可选但很关键）：打印 missing/unexpected 的前几项，确保 backbone 对齐
-                    incompatible = model.load_state_dict(state_dict, strict=False)
-                    missing = list(getattr(incompatible, 'missing_keys', []))
-                    unexpected = list(getattr(incompatible, 'unexpected_keys', []))
-                    if missing or unexpected:
-                        logger.warning(f"[Stage2] load_state_dict 非 strict 检查：missing={len(missing)}, unexpected={len(unexpected)}")
-                        if missing:
-                            logger.warning(f"[Stage2] missing_keys(前10): {missing[:10]}")
-                        if unexpected:
-                            logger.warning(f"[Stage2] unexpected_keys(前10): {unexpected[:10]}")
-
-                        # 只允许 head 类小范围不匹配；任何 backbone 缺失/多余都直接报错
-                        bad_missing = [k for k in missing if k.startswith('backbone.')]
-                        bad_unexpected = [k for k in unexpected if k.startswith('backbone.')]
-                        if bad_missing or bad_unexpected:
-                            raise RuntimeError(
-                                f"[Stage2] Backbone 权重不一致：missing(backbone)={bad_missing[:5]}, unexpected(backbone)={bad_unexpected[:5]}"
-                            )
-                else:
-                    logger.warning(f"[Stage2] 未找到 Stage1 权重: {stage1_path}，将从 RETFound 初始化开始训练")
-            else:
-                logger.warning("[Stage2] 未指定 Stage1 模型目录（stage1_models_dir / STAGE1_MODELS_DIR），将从 RETFound 初始化开始训练")
-
-        if gpu_count > 1:
-            model = nn.DataParallel(model)
-
-        # ===== 冻结→解冻策略 (Stage2) =====
-        frozen_modules = []
-        if config.CURRENT_STAGE == 2:
-            m_ref = model.module if isinstance(model, nn.DataParallel) else model
-            backbone = getattr(m_ref, 'backbone', None)
-            if backbone is None:
-                raise RuntimeError('缺少 backbone，无法冻结')
-
-            if config.FREEZE_PATCH_EMBED_STAGE2:
-                for p in getattr(backbone, 'patch_embed', []).parameters():
-                    p.requires_grad = False
-                if hasattr(backbone, 'pos_embed') and isinstance(backbone.pos_embed, torch.nn.Parameter):
-                    backbone.pos_embed.requires_grad = False
-                frozen_modules.append('patch_embed+pos_embed')
-
-            blocks = getattr(backbone, 'blocks', [])
-            num_freeze = min(config.FREEZE_BLOCKS_BEFORE_STAGE2, len(blocks))
-            for idx in range(num_freeze):
-                for p in blocks[idx].parameters():
-                    p.requires_grad = False
-            if num_freeze > 0:
-                frozen_modules.append(f'blocks[0:{num_freeze}]')
-
-            if frozen_modules:
-                logger.info(f"[Stage2] 冻结模块: {', '.join(frozen_modules)} | 解冻将在 epoch={config.FREEZE_EPOCHS_STAGE2}")
-
-        # ===== LLRD 参数组 =====
-        if config.USE_LLRD and config.CURRENT_STAGE == 2:
-            param_groups = get_optimizer_param_groups(model, base_lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY, layer_decay=config.LAYER_DECAY)
-            optimizer = optim.AdamW(param_groups, weight_decay=config.WEIGHT_DECAY)
-            lr_list = [g['lr'] for g in param_groups]
-            logger.info(f"[LLRD] min_lr={min(lr_list):.2e} max_lr={max(lr_list):.2e} groups={len(param_groups)}")
-        else:
-            optimizer = optim.AdamW(model.parameters(), lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
-            logger.info(f"[Optimizer] AdamW 单组 | lr={config.BASE_LR:.2e}")
-
-        # eta_min 按组比例缩放：设为 0 避免抬高低层 lr
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=0.0)
-
-        # ===== EMA =====
-        ema = None
-        if getattr(config, 'USE_EMA', False):
-            m_for_ema = model.module if isinstance(model, nn.DataParallel) else model
-            ema = ModelEmaV2(m_for_ema, decay=getattr(config, 'EMA_DECAY', 0.9999), device=config.DEVICE)
-            logger.info(f"[EMA] 启用 EMA | decay={getattr(config, 'EMA_DECAY', 0.9999)}")
-        
-        best_acc = 0.0
-        # Stage1/Stage2 命名策略：
-        # - Stage1：保留 vit_stage1_foldX.pth，同时写一份 vit_foldX.pth（便于只跑 Stage1 时也能推理）
-        # - Stage2：写 vit_foldX.pth 作为最终推理权重（会覆盖 Stage1 的同名文件）
-        if config.CURRENT_STAGE == 1:
-            model_save_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f'vit_stage1_fold{fold_idx}.pth')
-            model_alias_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f'vit_fold{fold_idx}.pth')
-        else:
-            model_save_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f'vit_fold{fold_idx}.pth')
-            model_alias_path = None
-
-        # OOF：Stage1 额外保留一份 stage1 文件；Stage2 覆盖 oof_fold_X.csv 作为最终阈值搜索输入
-        oof_save_path = os.path.join(config.OOF_DIR, f'oof_fold_{fold_idx}.csv')
-        oof_stage_save_path = os.path.join(config.OOF_DIR, f'oof_stage{config.CURRENT_STAGE}_fold_{fold_idx}.csv')
-
-        for epoch in range(config.EPOCHS):
-            # 解冻触发
-            if config.CURRENT_STAGE == 2 and frozen_modules and epoch == config.FREEZE_EPOCHS_STAGE2:
-                m_ref = model.module if isinstance(model, nn.DataParallel) else model
-                backbone = m_ref.backbone
-                if config.FREEZE_PATCH_EMBED_STAGE2:
-                    for p in getattr(backbone, 'patch_embed', []).parameters():
-                        p.requires_grad = True
-                    if hasattr(backbone, 'pos_embed') and isinstance(backbone.pos_embed, torch.nn.Parameter):
-                        backbone.pos_embed.requires_grad = True
-                blocks = getattr(backbone, 'blocks', [])
-                num_freeze = min(config.FREEZE_BLOCKS_BEFORE_STAGE2, len(blocks))
-                for idx in range(num_freeze):
-                    for p in blocks[idx].parameters():
-                        p.requires_grad = True
-                logger.info(f"[Stage2] Epoch {epoch} 解冻完成: {', '.join(frozen_modules)}")
-
-            model.train()
-            train_loss_accum = 0.0
-            
-            optimizer.zero_grad()
-            
-            pbar = tqdm(train_loader, desc=f"F{fold_idx} E{epoch+1}", mininterval=10)
-            
-            for step, (images, labels) in enumerate(pbar):
-                images = images.to(config.DEVICE)
-                # BCEWithLogitsLoss 需要 float 标签
-                labels = labels.to(config.DEVICE).float().view(-1)
-
-                # ===== Mixup 强正则化（按你的 Checklist 强制开启） =====
-                images, labels = _apply_mixup(images, labels, epoch)
-
-                # 仅在每个 epoch 的第一个 step 记录一次图片，避免日志过大
-                # 反归一化 (De-normalization) 以便人眼观看（假设 mean/std = 0.5）
-                outputs = model(images)
-                if outputs.ndim == 2 and outputs.size(1) == 1:
-                    outputs = outputs[:, 0]
-                outputs = outputs.view(-1)
-                loss = criterion(outputs, labels)
-                loss_val = loss.item()
-                loss = loss / config.ACCUM_STEPS
-                loss.backward()
-                
-                if (step + 1) % config.ACCUM_STEPS == 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), config.CLIP_GRAD_NORM)
-                    optimizer.step()
-                    if ema is not None:
-                        ema.update(model if not isinstance(model, nn.DataParallel) else model.module)
-                    optimizer.zero_grad()
-
-                train_loss_accum += loss_val
-
-                # TensorBoard（step 级）
-                global_step = step_offset + epoch * len(train_loader) + step
-                min_lr_step, max_lr_step, head_lr_step = _lr_stats(optimizer)
-                writer.add_scalar('Loss/train_step', loss_val, global_step)
-                writer.add_scalar('LR/min', min_lr_step, global_step)
-                writer.add_scalar('LR/max', max_lr_step, global_step)
-                writer.add_scalar('LR/head', head_lr_step, global_step)
-
-                pbar.set_postfix(loss=f"{loss_val:.4f}", lr_max=f"{max_lr_step:.2e}", lr_head=f"{head_lr_step:.2e}")
-            
-            model.eval()
-
-            val_correct = 0
-            val_total = 0
-            val_loss_accum = 0.0
-            oof_probs = []
-            oof_targets = []
-
-            with torch.no_grad():
-                eval_model = ema.module if ema is not None else model
-                for images, labels in val_loader:
-                    images = images.to(config.DEVICE)
-                    labels_f = labels.to(config.DEVICE).float()
-
-                    logits = eval_model(images)  # (B,)
-                    v_loss = criterion(logits, labels_f)
-                    val_loss_accum += v_loss.item()
-
-                    probs = torch.sigmoid(logits)
-                    preds = (probs >= 0.5).long()
-
-                    val_correct += (preds.cpu() == labels.long()).sum().item()
-                    val_total += labels.size(0)
-
-                    oof_probs.extend(probs.detach().cpu().numpy().tolist())
-                    oof_targets.extend(labels.detach().cpu().numpy().tolist())
-
-            avg_val_acc = val_correct / max(val_total, 1)
-            avg_train_loss = train_loss_accum / max(len(train_loader), 1)
-            avg_val_loss = val_loss_accum / max(len(val_loader), 1)
-
-            # ===== 阈值搜索（快速栅格） =====
-            oof_probs_np = np.asarray(oof_probs, dtype=np.float32)
-            oof_targets_np = np.asarray(oof_targets, dtype=np.int64)
-            thresholds = np.linspace(0.2, 0.8, 601, dtype=np.float32)
-            best_t_epoch = 0.5
-            best_acc_epoch = -1.0
-            for t in thresholds:
-                preds = (oof_probs_np >= t).astype(np.int64)
-                acc = float((preds == oof_targets_np).mean())
-                if acc > best_acc_epoch or (acc == best_acc_epoch and float(t) < best_t_epoch):
-                    best_acc_epoch = acc
-                    best_t_epoch = float(t)
-
-            # 混淆矩阵 @0.5 与 @bestT
-            def _confusion(probs_np: np.ndarray, targets_np: np.ndarray, thr: float):
-                preds = (probs_np >= thr).astype(np.int64)
-                tp = int(((preds == 1) & (targets_np == 1)).sum())
-                fp = int(((preds == 1) & (targets_np == 0)).sum())
-                tn = int(((preds == 0) & (targets_np == 0)).sum())
-                fn = int(((preds == 0) & (targets_np == 1)).sum())
-                acc = float((preds == targets_np).mean())
-                return tp, fp, tn, fn, acc
-
-            tp50, fp50, tn50, fn50, acc50 = _confusion(oof_probs_np, oof_targets_np, 0.5)
-            tpbt, fpbt, tnbt, fnbt, accbt = _confusion(oof_probs_np, oof_targets_np, best_t_epoch)
-
-            # TensorBoard（epoch 级，用 step 对齐，曲线连续）
-            epoch_end_step = step_offset + (epoch + 1) * len(train_loader) - 1
-            writer.add_scalar('Loss/train_epoch', avg_train_loss, epoch_end_step)
-            writer.add_scalar('Loss/val', avg_val_loss, epoch_end_step)
-            writer.add_scalar('Acc/val@0.5', acc50, epoch_end_step)
-            writer.add_scalar('Acc/val@bestT', accbt, epoch_end_step)
-            writer.add_scalar('BestT/val', best_t_epoch, epoch_end_step)
-            writer.add_scalar('FP/val@0.5', fp50, epoch_end_step)
-            writer.add_scalar('FN/val@0.5', fn50, epoch_end_step)
-            writer.add_scalar('FP/val@bestT', fpbt, epoch_end_step)
-            writer.add_scalar('FN/val@bestT', fnbt, epoch_end_step)
-            min_lr_epoch, max_lr_epoch, head_lr_epoch = _lr_stats(optimizer)
-            writer.add_scalar('LR/min_epoch', min_lr_epoch, epoch_end_step)
-            writer.add_scalar('LR/max_epoch', max_lr_epoch, epoch_end_step)
-            writer.add_scalar('LR/head_epoch', head_lr_epoch, epoch_end_step)
-
-            logger.info(
-                f"Epoch {epoch+1:02d} | TrainLoss={avg_train_loss:.4f} | ValLoss={avg_val_loss:.4f} | "
-                f"ValAcc@0.5={acc50:.4f} | ValAcc@bestT={accbt:.4f} | bestT={best_t_epoch:.3f} | "
-                f"FP@0.5={fp50} FN@0.5={fn50} | FP@bestT={fpbt} FN@bestT={fnbt} | "
-                f"LR[min/max/head]={min_lr_epoch:.2e}/{max_lr_epoch:.2e}/{head_lr_epoch:.2e}"
-            )
-
-            # 每个 epoch 后走一步 scheduler（按 epoch 维度）
-            scheduler.step()
-
-            # 保存最优模型 (以本轮 bestT 的 acc 为准)
-            if accbt > best_acc:
-                best_acc = accbt
-                model_to_save = ema.module if (ema is not None) else (model.module if isinstance(model, nn.DataParallel) else model)
-                torch.save(model_to_save.state_dict(), model_save_path)
-
-                if model_alias_path is not None:
-                    torch.save(model_to_save.state_dict(), model_alias_path)
-
-                oof_df = pd.DataFrame({'Preds': oof_probs, 'Targets': oof_targets})
-                oof_df.to_csv(oof_save_path, index=False)
-                oof_df.to_csv(oof_stage_save_path, index=False)
-
-                logger.info(f"   >>> Best Model Saved | Acc@bestT={best_acc:.4f} | bestT={best_t_epoch:.3f} | {model_save_path}")
-                if model_alias_path is not None:
-                    logger.info(f"   >>> Model Alias Updated: {model_alias_path}")
-                logger.info(f"   >>> OOF Saved: {oof_save_path} (n={len(oof_df)})")
-
-            writer.flush()
-
-        # Stage1 写 meta，供 Stage2 接续 step
-        if config.CURRENT_STAGE == 1:
-            global_step_end = step_offset + config.EPOCHS * len(train_loader) - 1
-            _write_stage1_meta(tb_fold_dir, global_step_end)
-
-        writer.close()
-
-        del model, optimizer, ema
-        torch.cuda.empty_cache()
-
-    logger.info("训练完成。")
-
-    # === 训练结束：用 OOF 搜索全局最佳阈值，并固化到 output（供 inference 直接复用） ===
-    try:
-        oof_paths = sorted(glob.glob(os.path.join(config.OOF_DIR, 'oof_fold_*.csv')))
-        if oof_paths:
-            best_t, best_acc = _search_best_threshold_from_oof(oof_paths)
-            payload = {
-                'run_id': config.RUN_ID,
-                'stage': int(config.CURRENT_STAGE),
-                'threshold': float(best_t),
-                'acc': float(best_acc),
-                'oof_files': [os.path.basename(p) for p in oof_paths],
-            }
-            os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-            path_run = os.path.join(config.OUTPUT_DIR, f'best_threshold_{config.RUN_ID}.json')
-            path_latest = os.path.join(config.OUTPUT_DIR, 'best_threshold.json')
-            with open(path_run, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            with open(path_latest, 'w', encoding='utf-8') as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            logger.info(f"[OOF] 全局最佳阈值已固化：t={best_t:.4f}, acc={best_acc:.6f} | {path_latest}")
-    except Exception as e:
-        logger.warning(f"[OOF] 阈值固化失败（不影响训练权重保存）：{e}")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

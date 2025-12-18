@@ -1,5 +1,6 @@
 import math
 import os
+from typing import Tuple
 
 import timm
 import torch
@@ -10,14 +11,7 @@ import config
 
 
 class GeM(nn.Module):
-    """GeM (Generalized Mean Pooling)
-
-    中文说明（为什么对眼底/青光眼有用）：
-    - 传统 GAP 会把整张图平均掉，视盘/视杯这种小区域的细节很容易被“稀释”。
-    - GeM 通过可学习的 p，把“更显著的响应”放大（当 p>1 时更接近 max pooling），
-      同时保持可微与稳定，往往能提升细粒度病灶/结构的判别能力。
-    """
-
+    """Generalized Mean Pooling (works for feature maps BxCxHxW)."""
     def __init__(self, p: float = 3.0, eps: float = 1e-6):
         super().__init__()
         self.p = nn.Parameter(torch.ones(1) * p)
@@ -25,152 +19,170 @@ class GeM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W)
-        x = x.clamp(min=self.eps)
-        x = x.pow(self.p)
-        x = x.mean(dim=(-2, -1))
-        x = x.pow(1.0 / self.p)
-        return x
+        x = x.clamp(min=self.eps).pow(self.p)
+        x = F.avg_pool2d(x, kernel_size=(x.size(-2), x.size(-1)))
+        return x.pow(1.0 / self.p).flatten(1)
 
 
 class RETFoundViTGeM(nn.Module):
-    """RETFound ViT + 双池化(Mean+GeM) 二分类头
+    """RETFound ViT backbone + token->2D reshape + GeM pooling + linear head.
 
-    结构“魔改点”（按你最新总结固化）：
-    1) 取 patch tokens（去掉 cls_token）
-    2) reshape 回 2D 特征图 (B, C, H, W)
-    3) 双保险池化：
-       - Mean / GAP：稳，保留整体信息与分布
-       - GeM(p可学习)：准，强调高响应区域，模拟视盘 ROI 关注
-    4) Concat([feat_mean, feat_gem]) 得到 (B, 2C)
-    5) Linear 输出 1 个 logit（配合 BCEWithLogitsLoss）
-
-    关键点：H/W 不写死，通过 token 数量动态推导，兼容 384/512 等不同分辨率。
+    Works only for timm ViT models that expose:
+    - patch_embed, cls_token, pos_embed, pos_drop, blocks, norm
     """
-
-    def __init__(self, backbone: nn.Module, embed_dim: int, num_classes: int = 1):
+    def __init__(self, backbone: nn.Module, num_classes: int = 1):
         super().__init__()
         self.backbone = backbone
         self.gem = GeM()
-        # 双池化拼接后维度翻倍
-        self.head = nn.Linear(embed_dim * 2, num_classes)
+        embed_dim = getattr(backbone, "embed_dim", backbone.num_features)
+        self.head = nn.Linear(embed_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # --- 复刻 timm ViT 的 token 流水线，确保能拿到“完整 token 序列” ---
-        # patch embedding: (B, C, H, W) -> (B, N, D)
+        # patch embedding (B,C,H,W)->(B,N,D)
         x = self.backbone.patch_embed(x)
-        # 追加 cls_token: (B, 1+N, D)
+        # add cls token
         cls_token = self.backbone.cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_token, x), dim=1)
-        # 位置编码 + dropout
+        # pos embed (+ drop)
         x = x + self.backbone.pos_embed
         x = self.backbone.pos_drop(x)
-        # transformer blocks
+        # transformer blocks + norm
         for blk in self.backbone.blocks:
             x = blk(x)
         x = self.backbone.norm(x)
 
-        # 1) 去掉 cls_token，取 patch tokens
-        patch_tokens = x[:, 1:, :]  # (B, N, D)
-        b, n, d = patch_tokens.shape
-
-        # 2) N -> (H, W) 动态推导（要求严谨，兼容 384/512）
-        # 对于正方形输入且固定 patch_size=16，N 应该是完全平方数：
-        # 384: (384/16)^2=24^2=576
-        # 512: (512/16)^2=32^2=1024
-        h = int(math.sqrt(n))
-        w = h
-        if h * w != n:
-            raise RuntimeError(
-                f"patch token 数量不是完全平方数，无法还原2D特征图: N={n}。"
-                "请确认输入是正方形且与 patch_size 对齐。"
-            )
-
-        # (B, N, D) -> (B, H, W, D) -> (B, D, H, W)
-        feat_map = patch_tokens.reshape(b, h, w, d).permute(0, 3, 1, 2).contiguous()
-
-        # 3) 双池化：Mean 兜底 + GeM 拔高
-        # Mean/GAP：保留全局信息，提升稳定性
-        feat_mean = feat_map.mean(dim=(-2, -1))				# (B, D)
-        # GeM：更强调高响应区域，细粒度聚焦视盘/杯盘比等结构
-        feat_gem = self.gem(feat_map)						# (B, D)
-        feat = torch.cat([feat_mean, feat_gem], dim=1)	# (B, 2D)
-
-        # 4) Linear head: (B, 2D) -> (B, 1)
-        logits = self.head(feat)
-        # 输出 reshape 成 (B,) 更方便 BCEWithLogitsLoss
-        return logits.squeeze(-1)
+        # drop CLS, reshape patch tokens to (B,D,h,w)
+        x = x[:, 1:, :]  # (B, N, D)
+        B, N, D = x.shape
+        h = w = int(math.sqrt(N))
+        if h * w != N:
+            # fallback: treat as 1D tokens -> mean
+            feat = x.mean(dim=1)
+        else:
+            x = x.transpose(1, 2).reshape(B, D, h, w)
+            feat = self.gem(x)
+        out = self.head(feat)
+        return out.squeeze(-1)
 
 
-def _load_retfound_weights_with_pos_embed_interpolation(model: nn.Module, weight_path: str) -> None:
-    """加载本地 RETFound 权重，并对 pos_embed 做插值以适配不同分辨率。
+class TimmBinaryClassifier(nn.Module):
+    """Generic timm backbone (features) + linear head. Adds .backbone and .head for LLRD/freeze."""
+    def __init__(self, backbone: nn.Module, num_classes: int = 1):
+        super().__init__()
+        self.backbone = backbone
+        feat_dim = getattr(backbone, "num_features", None)
+        if feat_dim is None:
+            raise RuntimeError("backbone.num_features missing")
+        self.head = nn.Linear(feat_dim, num_classes)
 
-    注意：
-    - RETFound 通常在 224 预训练（14x14 patch grid），而我们训练/推理用 384/512（24x24/32x32）。
-    - 位置编码不插值会 shape mismatch；插值是 ViT 迁移里非常关键的“尺寸对齐”步骤。
-    """
-    if not os.path.exists(weight_path):
-        raise FileNotFoundError(f"找不到 RETFound 权重文件: {weight_path}")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Most timm models support forward_features
+        if hasattr(self.backbone, "forward_features"):
+            feat = self.backbone.forward_features(x)
+        else:
+            feat = self.backbone(x)
+        # Some models return (B, C, H, W); pool if needed
+        if feat.dim() == 4:
+            feat = feat.mean(dim=(-2, -1))
+        out = self.head(feat)
+        return out.squeeze(-1)
 
+
+def _load_checkpoint(path: str) -> dict:
     try:
-        checkpoint = torch.load(weight_path, map_location='cpu', weights_only=False)
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
-        checkpoint = torch.load(weight_path, map_location='cpu')
-
-    checkpoint_model = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
-
-    # --- 位置编码插值 ---
-    pos_embed_key = 'pos_embed'
-    state_dict = model.state_dict()
-    if pos_embed_key in checkpoint_model and pos_embed_key in state_dict:
-        pos_embed_checkpoint = checkpoint_model[pos_embed_key]
-        embedding_size = pos_embed_checkpoint.shape[-1]
-        num_extra_tokens = 1  # cls token
-
-        orig_size = int((pos_embed_checkpoint.shape[1] - num_extra_tokens) ** 0.5)
-        new_size = int((state_dict[pos_embed_key].shape[1] - num_extra_tokens) ** 0.5)
-
-        if orig_size != new_size:
-            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
-            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
-            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
-            pos_tokens = F.interpolate(pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
-            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
-            checkpoint_model[pos_embed_key] = torch.cat((extra_tokens, pos_tokens), dim=1)
-
-    # 丢弃不匹配 head（我们的 head 是新建的）
-    for k in list(checkpoint_model.keys()):
-        if k.startswith('head') or k.startswith('fc') or '.head.' in k:
-            del checkpoint_model[k]
-
-    msg = model.load_state_dict(checkpoint_model, strict=False)
-    print(f"[RETFound] 权重加载完成 | missing={len(msg.missing_keys)} unexpected={len(msg.unexpected_keys)}")
+        ckpt = torch.load(path, map_location="cpu")
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        return ckpt["model"]
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        return ckpt["state_dict"]
+    return ckpt
 
 
-def get_model(model_name: str, num_classes: int = 1, pretrained: bool = False) -> nn.Module:
-    """构建 RETFound + GeM 的二分类模型。
+def _interpolate_pos_embed(vit: nn.Module, checkpoint_model: dict) -> dict:
+    """Interpolate ViT pos_embed to match current model resolution."""
+    pos_embed_key = "pos_embed"
+    if not (hasattr(vit, "pos_embed") and pos_embed_key in checkpoint_model):
+        return checkpoint_model
 
-    兼容 nn.DataParallel：直接返回标准 nn.Module，外部可包 DataParallel。
-    """
-    _ = pretrained  # 预留参数，保持旧调用兼容
+    pos_embed_checkpoint = checkpoint_model[pos_embed_key]
+    pos_embed_model = vit.pos_embed
+    if pos_embed_checkpoint.shape == pos_embed_model.shape:
+        return checkpoint_model
 
-    print(f"[Model] 构建 RETFound+GeM | stage={config.CURRENT_STAGE} | img={config.IMAGE_SIZE} | num_classes={num_classes}")
+    # checkpoint: (1, old_tokens, D) ; model: (1, new_tokens, D)
+    embedding_size = pos_embed_checkpoint.shape[-1]
+    num_patches = vit.patch_embed.num_patches
+    num_extra_tokens = vit.pos_embed.shape[-2] - num_patches
 
-    # 创建 ViT-Large 主干：num_classes=0 让 timm 去掉原分类头（我们会自建 head）
-    backbone = timm.create_model(
-        model_name,
-        pretrained=False,
-        num_classes=0,
-        drop_path_rate=0.2,
-        img_size=config.IMAGE_SIZE,
-    )
+    # class token and others
+    extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+    pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
 
-    embed_dim = getattr(backbone, 'embed_dim', None)
-    if embed_dim is None:
-        raise RuntimeError('无法从 timm ViT backbone 读取 embed_dim')
+    # old grid
+    old_grid = int(math.sqrt(pos_tokens.shape[1]))
+    new_grid = int(math.sqrt(num_patches))
+    if old_grid * old_grid != pos_tokens.shape[1]:
+        return checkpoint_model  # can't infer, skip
 
-    # 载入 RETFound 预训练权重（本地文件）
-    _load_retfound_weights_with_pos_embed_interpolation(backbone, config.RETFOUND_PATH)
+    pos_tokens = pos_tokens.reshape(1, old_grid, old_grid, embedding_size).permute(0, 3, 1, 2)
+    pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=(new_grid, new_grid), mode="bicubic", align_corners=False)
+    pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(1, new_grid * new_grid, embedding_size)
 
-    # 包装成“patch token -> GeM -> head”的结构
-    model = RETFoundViTGeM(backbone=backbone, embed_dim=embed_dim, num_classes=num_classes)
+    new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+    checkpoint_model[pos_embed_key] = new_pos_embed
+    return checkpoint_model
+
+
+def load_retfound_weights(vit_backbone: nn.Module, weight_path: str) -> Tuple[int, int]:
+    """Load RETFound weights into a ViT backbone (strict=False). Returns (missing, unexpected) counts."""
+    if not os.path.exists(weight_path):
+        raise FileNotFoundError(f"RETFound weights not found: {weight_path}")
+
+    checkpoint_model = _load_checkpoint(weight_path)
+
+    # interpolate pos_embed if needed
+    checkpoint_model = _interpolate_pos_embed(vit_backbone, checkpoint_model)
+
+    msg = vit_backbone.load_state_dict(checkpoint_model, strict=False)
+    missing = len(getattr(msg, "missing_keys", []))
+    unexpected = len(getattr(msg, "unexpected_keys", []))
+    return missing, unexpected
+
+
+def get_model() -> nn.Module:
+    name = config.MODEL_NAME.lower()
+
+    # -----------------------------
+    # Swin / ConvNeXt / etc (ImageNet pretrained by default)
+    # -----------------------------
+    if "swin" in name:
+        # Build backbone without classifier head
+        backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0)
+        model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
+        print(f"[Model] Swin backbone: {config.MODEL_NAME} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
+        return model
+
+    # -----------------------------
+    # ViT (RETFound)
+    # -----------------------------
+    if "vit" in name:
+        # Create timm ViT backbone without classifier head
+        backbone = timm.create_model(config.MODEL_NAME, pretrained=False, num_classes=0)
+        # Load RETFound weights
+        missing, unexpected = load_retfound_weights(backbone, config.RETFOUND_PATH)
+
+        if config.USE_GEM:
+            model = RETFoundViTGeM(backbone, num_classes=config.NUM_CLASSES)
+            print(f"[Model] RETFound+GeM | {config.MODEL_NAME} | img={config.IMAGE_SIZE} | missing={missing} unexpected={unexpected}")
+        else:
+            model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
+            print(f"[Model] RETFound ViT | {config.MODEL_NAME} | img={config.IMAGE_SIZE} | missing={missing} unexpected={unexpected}")
+        return model
+
+    # Fallback: any timm model
+    backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0)
+    model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
+    print(f"[Model] timm backbone: {config.MODEL_NAME} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
     return model

@@ -4,13 +4,21 @@ import cv2
 import numpy as np
 from torch.utils.data import Dataset
 from PIL import Image
-from torchvision import transforms
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+try:
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+    _HAS_ALB = True
+except Exception:
+    A = None
+    ToTensorV2 = None
+    _HAS_ALB = False
 import config  # 导入配置以获取 target size
 
 def get_transforms():
     """集中定义 train/val/test 变换，供 train/benchmark/inference 复用。"""
+    if not _HAS_ALB:
+        return None, None, None
+
     train_transform = A.Compose([
         A.HorizontalFlip(p=0.5),
         A.ShiftScaleRotate(
@@ -76,9 +84,13 @@ def ben_graham_preprocessing(image, target_size=config.IMAGE_SIZE):
     l, a, b = cv2.split(lab)
     
     # 对 L 通道 (亮度) 应用 CLAHE
-    # ClipLimit=2.0 是经验值，既增强血管又不过分放大噪声
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    l = clahe.apply(l)
+    # CLAHE 会放大局部对比度，也可能放大噪声：提供开关与强度可控
+    if config.USE_CLAHE:
+        clahe = cv2.createCLAHE(
+            clipLimit=float(config.CLAHE_CLIPLIMIT),
+            tileGridSize=(int(config.CLAHE_TILEGRIDSIZE), int(config.CLAHE_TILEGRIDSIZE)),
+        )
+        l = clahe.apply(l)
     
     # 合并并转回 RGB
     lab = cv2.merge((l, a, b))
@@ -131,7 +143,7 @@ class MedicalDataset(Dataset):
                 transformed = self.transform(image=img_np)
                 image = transformed["image"]
             else:
-                image = transforms.ToTensor()(image)
+                image = torch.from_numpy(np.array(image).transpose(2,0,1)).float() / 255.0
 
             # 标签处理：严格用父目录名判断
             if self.mode in ['train', 'val']:

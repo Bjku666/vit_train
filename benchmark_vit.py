@@ -1,174 +1,183 @@
-# benchmark_vit.py (最终修正版 - 兼容 DataParallel)
-"""
-功能：对验证集做多模型 2x TTA 融合评测（仅原图+水平翻转，严禁旋转），自动搜索最佳阈值并输出 benchmark JSON。
-用法示例：
-    CONFIG_INIT_DIRS=0 python benchmark_vit.py --model_paths "models/run_xxx/vit_fold*.pth"
-输出：
-    output/benchmark_result_YYYYMMDD_HHMMSS.json，包含阈值/ACC/F1；不创建训练日志目录。
-注意：依赖 config.LABELED_TEST_DIR 作为有标签验证集路径。
+"""benchmark_vit.py
+
+Evaluate checkpoints on a labeled set (default: config.LABELED_TEST_DIR).
+Supports:
+- single-split: evaluate one checkpoint OR sweep multiple epochs
+- kfold: pass multiple checkpoints and average probs
+- TTA: identity + hflip (2x)
 """
 
-import os
 import argparse
+import glob
 import json
-import torch
+import os
+from typing import List, Tuple
+
 import numpy as np
+import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
-import glob
 
-# === 评测脚本只读：阻断训练目录自动创建 ===
-# 在导入 config 之前关闭目录初始化开关，避免生成 run_* 或 logs/*
-os.environ['CONFIG_INIT_DIRS'] = '0'
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import config
-from model import get_model
 from dataset import MedicalDataset, get_transforms
+from model import get_model
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Final ViT Benchmark & Ensemble Script")
-    parser.add_argument('--model_paths', nargs='+', required=True, 
-                        help="Path to model files. Use quotes for wildcards, e.g., 'models/run_xxx/vit_fold*.pth'")
-    parser.add_argument('--image_size', type=int, default=None, help="Override image size for building model (avoid env CURRENT_STAGE mismatch)")
-    parser.add_argument('--stage', type=int, default=None, help="Optional stage tag for logging")
-    return parser.parse_args()
 
-def tta_shift(images: torch.Tensor, shift_px: int):
-    # 使用 padding + slice，避免环绕效应
-    pad = torch.nn.functional.pad(images, (0, 0, 0, 0, shift_px, shift_px, shift_px, shift_px))
-    views = []
-    # up
-    views.append(pad[:, :, shift_px*2:, shift_px:-shift_px])
-    # down
-    views.append(pad[:, :, :-shift_px*2, shift_px:-shift_px])
-    # left
-    views.append(pad[:, :, shift_px:-shift_px, shift_px*2:])
-    # right
-    views.append(pad[:, :, shift_px:-shift_px, :-shift_px*2])
-    return views
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1 / (1 + np.exp(-x))
+
+
+def search_best_threshold(probs: np.ndarray, labels: np.ndarray) -> Tuple[float, float]:
+    best_thr, best_acc = 0.5, -1.0
+    for thr in np.linspace(0.2, 0.8, 121):
+        pred = (probs >= thr).astype(np.int64)
+        acc = (pred == labels).mean()
+        if acc > best_acc:
+            best_acc, best_thr = acc, float(thr)
+    return best_thr, float(best_acc)
+
+
+def confusion(labels: np.ndarray, probs: np.ndarray, thr: float):
+    pred = (probs >= thr).astype(np.int64)
+    tn = int(((pred == 0) & (labels == 0)).sum())
+    fp = int(((pred == 1) & (labels == 0)).sum())
+    fn = int(((pred == 0) & (labels == 1)).sum())
+    tp = int(((pred == 1) & (labels == 1)).sum())
+    return [[tn, fp], [fn, tp]]
+
+
+def load_model_from_ckpt(ckpt_path: str) -> torch.nn.Module:
+    # Build model from current config (ensure MODEL_NAME/IMAGE_SIZE are correct in your env)
+    model = get_model().to(config.DEVICE)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
+    model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def predict_probs(models: List[torch.nn.Module], loader: DataLoader, tta: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+    all_probs = []
+    all_labels = []
+    for images, labels in tqdm(loader, desc="Infer", leave=False):
+        images = images.to(config.DEVICE, non_blocking=True)
+        labels_np = labels.numpy().astype(np.int64)
+
+        prob_sum = torch.zeros(images.size(0), device=config.DEVICE, dtype=torch.float32)
+
+        views = [images]
+        if tta:
+            views.append(torch.flip(images, dims=[3]))  # hflip
+
+        denom = len(models) * len(views)
+
+        for v in views:
+            for m in models:
+                logits = m(v).float()
+                prob_sum += torch.sigmoid(logits)
+
+        probs = (prob_sum / denom).detach().cpu().numpy()
+        all_probs.append(probs)
+        all_labels.append(labels_np)
+
+    return np.concatenate(all_probs), np.concatenate(all_labels)
+
+
+def resolve_ckpts(ckpt_input: str, pattern: str, select: str, avg_last_k: int) -> List[str]:
+    # If input is a file, just use it
+    if os.path.isfile(ckpt_input):
+        return [ckpt_input]
+
+    # If input is a dir, glob inside
+    if os.path.isdir(ckpt_input):
+        ckpts = sorted(glob.glob(os.path.join(ckpt_input, pattern)))
+    else:
+        # treat as glob
+        ckpts = sorted(glob.glob(ckpt_input))
+
+    if len(ckpts) == 0:
+        raise FileNotFoundError(f"No checkpoints found for: {ckpt_input} (pattern={pattern})")
+
+    # selection
+    s = (select or "").lower().strip()
+    if s.startswith("epoch:"):
+        e = int(s.split("epoch:")[1])
+        hit = [p for p in ckpts if f"epoch{e:03d}" in os.path.basename(p)]
+        if not hit:
+            raise FileNotFoundError(f"epoch:{e} not found in ckpts")
+        return hit
+
+    if s in ["best", "best.pth"]:
+        hit = [p for p in ckpts if p.endswith("_best.pth") or "best.pth" in os.path.basename(p)]
+        if hit:
+            return hit[:1]
+        # fallback: last
+        return [ckpts[-1]]
+
+    if s == "last":
+        return [ckpts[-1]]
+
+    if avg_last_k > 1:
+        return ckpts[-avg_last_k:]
+
+    # default: use all (ensemble) if multiple provided
+    return ckpts
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path/dir/glob. Default: current run dir.")
+    parser.add_argument("--pattern", type=str, default="*_stage2_*.pth", help="Glob pattern within a dir.")
+    parser.add_argument("--select", type=str, default="best", help="best | last | epoch:NNN")
+    parser.add_argument("--avg_last_k", type=int, default=0, help="If >1, average last K epoch checkpoints (same arch).")
+    parser.add_argument("--data_dir", type=str, default="", help="Labeled eval dir. Default: config.LABELED_TEST_DIR")
+    parser.add_argument("--batch_size", type=int, default=0, help="Override batch size for benchmark.")
+    parser.add_argument("--no_tta", action="store_true")
+    args = parser.parse_args()
 
-    if args.stage is not None:
-        config.CURRENT_STAGE = args.stage
-    if args.image_size is not None and args.image_size != config.IMAGE_SIZE:
-        print(f"[Warn] Override IMAGE_SIZE from {config.IMAGE_SIZE} -> {args.image_size}")
-        config.IMAGE_SIZE = args.image_size
-    
-    model_files = []
-    for path_pattern in args.model_paths:
-        model_files.extend(glob.glob(path_pattern))
-    
-    if not model_files:
-        print(f"❌ Error: No model files found matching the pattern: {args.model_paths}")
-        return
+    eval_dir = args.data_dir or config.LABELED_TEST_DIR
+    _, val_tf, _ = get_transforms()
+    ds = MedicalDataset(root_dir=eval_dir, mode="val", transform=val_tf)
+    bs = args.batch_size or max(1, config.BATCH_SIZE)
+    dl = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True)
 
-    print(f"Found {len(model_files)} models for evaluation. ImageSize={config.IMAGE_SIZE}")
+    ckpt_input = args.ckpt or config.CURRENT_RUN_MODELS_DIR
+    ckpt_paths = resolve_ckpts(ckpt_input, args.pattern, args.select, args.avg_last_k)
 
-    # 1. 准备数据（使用验证期同款归一化）
-    _, test_transform = get_transforms()
-    dataset = MedicalDataset(config.LABELED_TEST_DIR, mode='train', transform=test_transform)
-    loader = DataLoader(dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=4)
+    models = [load_model_from_ckpt(p) for p in ckpt_paths]
+    probs, labels = predict_probs(models, dl, tta=(not args.no_tta))
 
-    # 2. 加载模型
-    models = []
-    for path in model_files:
-        print(f"  -> Loading {os.path.basename(path)}")
-        m = get_model(config.MODEL_NAME, num_classes=config.NUM_CLASSES, pretrained=False)
-        try:
-            # 加载权重字典（兼容不同 torch 版本）
-            try:
-                state_dict = torch.load(path, map_location=config.DEVICE, weights_only=True)
-            except TypeError:
-                state_dict = torch.load(path, map_location=config.DEVICE)
-            
-            # === 核心修复: 智能处理 DataParallel 的 'module.' 前缀 ===
-            # 如果 state_dict 的 key 是以 'module.' 开头，就创建一个新的字典去掉这个前缀
-            if list(state_dict.keys())[0].startswith('module.'):
-                print("     L─ Detected 'module.' prefix, stripping it...")
-                new_state_dict = {k[7:]: v for k, v in state_dict.items()}
-                state_dict = new_state_dict
-            # =========================================================
+    best_thr, best_acc = search_best_threshold(probs, labels)
+    cm = confusion(labels, probs, best_thr)
 
-            m.load_state_dict(state_dict)
-            m.to(config.DEVICE)
-            m.eval()
-            models.append(m)
-        except Exception as e:
-            print(f"    L─Error loading {os.path.basename(path)}: {e}. Skipping this model.")
-            
-    if not models:
-        print("No models were loaded successfully. Aborting.")
-        return
+    result = {
+        "ckpts": ckpt_paths,
+        "best_threshold": best_thr,
+        "accuracy": best_acc,
+        "confusion_matrix": cm,
+        "tta": not args.no_tta,
+        "avg_last_k": args.avg_last_k,
+        "select": args.select,
+        "pattern": args.pattern,
+        "model_name": config.MODEL_NAME,
+        "image_size": config.IMAGE_SIZE,
+        "stage": config.CURRENT_STAGE,
+    }
 
-    # 3. 推理 (严格 2x TTA：原图 + 水平翻转)
-    all_probs, all_labels = [], []
-    
-    print("\nRunning Inference with 2x TTA (Identity + HFlip, No Rotation)...")
-    shift_tta = int(os.environ.get('SHIFT_TTA', '0')) == 1
-    shift_px = int(os.environ.get('SHIFT_PX', '8'))
+    print("===== Benchmark =====")
+    print(f"ckpts: {len(ckpt_paths)}")
+    print(f"best_thr: {best_thr:.3f}")
+    print(f"acc: {best_acc:.4f}")
+    print(f"cm: {cm}")
 
-    with torch.no_grad():
-        for images, labels in tqdm(loader):
-            images = images.to(config.DEVICE)
-            labels = labels.to(config.DEVICE)
-
-            prob_sum = torch.zeros(images.size(0), device=config.DEVICE)
-            tta_views = [images, torch.flip(images, dims=[3])]
-            if shift_tta:
-                shift_views = tta_shift(images, shift_px)
-                tta_views.extend(shift_views)
-                tta_views.extend([torch.flip(v, dims=[3]) for v in shift_views])
-            denom = float(len(models) * len(tta_views))
-            
-            for model in models:
-                for view in tta_views:
-                    logits = model(view)
-                    if logits.ndim == 2 and logits.size(1) == 1:
-                        logits = logits[:, 0]
-                    prob_sum += torch.sigmoid(logits)
-
-            avg_prob = (prob_sum / denom).detach().cpu().numpy()
-            all_probs.extend(avg_prob)
-            all_labels.extend(labels.detach().cpu().numpy())
-
-    # 4. 寻找最佳阈值（与 inference 对齐：0.2~0.8，步长 0.001）
-    best_threshold, best_acc, best_f1 = 0.5, -1.0, 0.0
-    thresholds = np.linspace(0.2, 0.8, 601, dtype=np.float32)
-    probs_np = np.asarray(all_probs, dtype=np.float32)
-    labels_np = np.asarray(all_labels, dtype=np.int64)
-    for t in thresholds:
-        preds = (probs_np >= t).astype(np.int64)
-        acc = accuracy_score(labels_np, preds)
-        f1 = f1_score(labels_np, preds)
-        if acc > best_acc or (acc == best_acc and float(t) < best_threshold):
-            best_acc, best_f1, best_threshold = acc, f1, float(t)
-
-    # 5. 输出结果
-    print(f"\n====== Final Benchmark Results ({len(models)} Models) ======")
-    print(f"Best Threshold: {best_threshold:.3f}")
-    print(f"Accuracy:       {best_acc:.4f}")
-    print(f"F1 Score:       {best_f1:.4f}")
-    
-    final_preds = (probs_np >= best_threshold).astype(np.int64)
-    print("Confusion Matrix:")
-    print(confusion_matrix(labels_np, final_preds))
-
-    # 保存结果
-    # 仅创建评测输出目录，不触碰训练日志/模型目录
+    # save json
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    res_path = os.path.join(config.OUTPUT_DIR, f"benchmark_result_{config.RUN_ID}.json")
-    with open(res_path, 'w') as f:
-        json.dump({
-            "models_used": [os.path.basename(p) for p in model_files],
-            "threshold": best_threshold,
-            "accuracy": best_acc,
-            "f1_score": best_f1
-        }, f, indent=4)
-    print(f"\n Results saved to {res_path}")
+    out_path = os.path.join(config.OUTPUT_DIR, f"benchmark_result_{config.RUN_ID}.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"saved: {out_path}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

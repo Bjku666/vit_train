@@ -1,276 +1,133 @@
 """inference.py
-功能升级版：
-1. 支持 --only_eval 参数：仅读取 OOF 计算最佳阈值并打印，不进行后续推理（秒级反馈）。
-2. 推理使用严格 2x TTA：仅原图 + 水平翻转（严禁 90° 旋转）。
+
+Generate submission CSV for the unlabeled test set.
+- Supports selecting checkpoints by epoch/best/last
+- Supports averaging last K epochs (cheap SWA-style ensemble)
+- Uses sigmoid (binary logit) and a threshold
 """
 
-import os
 import argparse
-import torch
+import glob
+import json
+import os
+from typing import List
+
 import numpy as np
 import pandas as pd
+import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import glob
-from datetime import datetime
 
-# 在导入 config 之前关闭目录初始化开关
-os.environ['CONFIG_INIT_DIRS'] = '0'
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import config
-from model import get_model
 from dataset import MedicalDataset, get_transforms
-
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Final Submission Inference Script")
-    
-    # 接收模型路径
-    parser.add_argument('--model_paths', nargs='+', required=True, 
-                        help="Path to model files. Use quotes for wildcards.")
-
-    # OOF 文件路径 (默认读取 output/oof/oof_fold_*.csv)
-    parser.add_argument('--oof_paths', nargs='+', default=[],
-                        help="OOF csv paths (supports wildcards).")
-    
-    # [关键] 仅评测模式开关
-    parser.add_argument('--only_eval', action='store_true', 
-                        help="If set, only search best threshold based on OOF and exit.")
-    parser.add_argument('--image_size', type=int, default=None, help="Override image size for building model (avoid env CURRENT_STAGE mismatch)")
-    parser.add_argument('--stage', type=int, default=None, help="Optional stage tag for logging")
-                        
-    return parser.parse_args()
+from model import get_model
 
 
-def build_test_transform():
-    _, val_t = get_transforms()
-    return val_t
+def resolve_ckpts(ckpt_input: str, pattern: str, select: str, avg_last_k: int) -> List[str]:
+    if os.path.isfile(ckpt_input):
+        return [ckpt_input]
+    if os.path.isdir(ckpt_input):
+        ckpts = sorted(glob.glob(os.path.join(ckpt_input, pattern)))
+    else:
+        ckpts = sorted(glob.glob(ckpt_input))
+    if len(ckpts) == 0:
+        raise FileNotFoundError(f"No checkpoints found for: {ckpt_input} (pattern={pattern})")
+
+    s = (select or "").lower().strip()
+    if s.startswith("epoch:"):
+        e = int(s.split("epoch:")[1])
+        hit = [p for p in ckpts if f"epoch{e:03d}" in os.path.basename(p)]
+        if not hit:
+            raise FileNotFoundError(f"epoch:{e} not found in ckpts")
+        return hit
+
+    if s in ["best", "best.pth"]:
+        hit = [p for p in ckpts if p.endswith("_best.pth") or "best.pth" in os.path.basename(p)]
+        if hit:
+            return hit[:1]
+        return [ckpts[-1]]
+
+    if s == "last":
+        return [ckpts[-1]]
+
+    if avg_last_k > 1:
+        return ckpts[-avg_last_k:]
+
+    return ckpts
 
 
-def load_oof(oof_paths):
-    """读取并合并 OOF CSV"""
-    probs = []
-    targets = []
-    if not oof_paths:
-        return np.array([]), np.array([])
-        
-    for p in oof_paths:
-        df = pd.read_csv(p)
-        if 'Preds' not in df.columns or 'Targets' not in df.columns:
-            raise ValueError(f"OOF 文件列名必须包含 Preds/Targets，但在 {p} 中未找到")
-        probs.append(df['Preds'].values.astype(np.float32))
-        targets.append(df['Targets'].values.astype(np.int64))
-    
-    if not probs:
-        return np.array([]), np.array([])
-        
-    probs = np.concatenate(probs, axis=0)
-    targets = np.concatenate(targets, axis=0)
-    return probs, targets
+def load_model_from_ckpt(ckpt_path: str) -> torch.nn.Module:
+    model = get_model().to(config.DEVICE)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
+    model.load_state_dict(sd, strict=False)
+    model.eval()
+    return model
 
 
-def search_best_threshold(probs: np.ndarray, targets: np.ndarray) -> float:
-    """在 [0.2, 0.8] 搜索最佳阈值"""
-    thresholds = np.linspace(0.2, 0.8, 601, dtype=np.float32)
-    best_t = 0.5
-    best_acc = -1.0
-    
-    # 简单的向量化计算加速
-    for t in thresholds:
-        preds = (probs >= t).astype(np.int64)
-        acc = (preds == targets).mean()
-        if acc > best_acc or (acc == best_acc and t < best_t):
-            best_acc = acc
-            best_t = float(t)
-    
-    print("\n" + "="*45)
-    print(f" 📊 [OOF Evaluation] 内部验证集评测报告")
-    print(f" ---------------------------------------------")
-    print(f" 样本总数: {len(targets)}")
-    print(f" 最佳阈值: {best_t:.4f}")
-    print(f" 最佳 Acc: {best_acc:.6f}  (这是预期的上线)")
-    print("="*45 + "\n")
-    return best_t
+@torch.no_grad()
+def predict_probs(models: List[torch.nn.Module], loader: DataLoader, tta: bool = True):
+    filenames = []
+    probs_out = []
+    for batch in tqdm(loader, desc="Infer", leave=False):
+        images, names = batch
+        images = images.to(config.DEVICE, non_blocking=True)
 
+        prob_sum = torch.zeros(images.size(0), device=config.DEVICE, dtype=torch.float32)
+        views = [images]
+        if tta:
+            views.append(torch.flip(images, dims=[3]))  # hflip
+        denom = len(models) * len(views)
 
-def _load_solid_threshold():
-    """从 output/best_threshold.json 读取固化阈值（由训练/评测脚本写入）。"""
-    path = os.path.join(config.OUTPUT_DIR, 'best_threshold.json')
-    if not os.path.exists(path):
-        return None
-    try:
-        df = pd.read_json(path)
-        # 兼容 dict/json
-        if isinstance(df, pd.Series):
-            t = float(df.get('threshold', np.nan))
-        else:
-            # 不太可能走到这里
-            t = float(df['threshold'].iloc[0])
-        if np.isfinite(t):
-            return t
-    except Exception:
-        pass
-    try:
-        import json
-        with open(path, 'r', encoding='utf-8') as f:
-            obj = json.load(f)
-        t = float(obj.get('threshold', float('nan')))
-        return t if np.isfinite(t) else None
-    except Exception:
-        return None
+        for v in views:
+            for m in models:
+                logits = m(v).float()
+                prob_sum += torch.sigmoid(logits)
 
+        probs = (prob_sum / denom).detach().cpu().numpy()
+        probs_out.append(probs)
+        filenames.extend(list(names))
+    return filenames, np.concatenate(probs_out)
 
-def _save_solid_threshold(best_threshold: float, oof_files: list[str]) -> None:
-    """将 OOF 搜出来的阈值固化到 output/best_threshold.json，供后续推理直接复用。"""
-    try:
-        import json
-        os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-        payload = {
-            'run_id': config.RUN_ID,
-            'stage': int(getattr(config, 'CURRENT_STAGE', 0)),
-            'threshold': float(best_threshold),
-            'oof_files': [os.path.basename(p) for p in oof_files],
-        }
-        path_latest = os.path.join(config.OUTPUT_DIR, 'best_threshold.json')
-        with open(path_latest, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception:
-        return
-
-
-def tta_2x(images: torch.Tensor):
-    """严格 2x TTA：仅原图 + 水平翻转（不做任何旋转）"""
-    return [images, torch.flip(images, dims=[3])]
-
-
-def tta_shift(images: torch.Tensor, shift_px: int):
-    pad = torch.nn.functional.pad(images, (0, 0, 0, 0, shift_px, shift_px, shift_px, shift_px))
-    views = []
-    views.append(pad[:, :, shift_px*2:, shift_px:-shift_px])  # up
-    views.append(pad[:, :, :-shift_px*2, shift_px:-shift_px])  # down
-    views.append(pad[:, :, shift_px:-shift_px, shift_px*2:])  # left
-    views.append(pad[:, :, shift_px:-shift_px, :-shift_px*2])  # right
-    return views
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, default="", help="Checkpoint path/dir/glob. Default: current run dir.")
+    parser.add_argument("--pattern", type=str, default="*_stage2_*.pth", help="Glob pattern within ckpt dir.")
+    parser.add_argument("--select", type=str, default="best", help="best | last | epoch:NNN")
+    parser.add_argument("--avg_last_k", type=int, default=0, help="Average last K epoch checkpoints.")
+    parser.add_argument("--threshold", type=float, default=None, help="Override threshold.")
+    parser.add_argument("--threshold_json", type=str, default="", help="JSON containing best_threshold.")
+    parser.add_argument("--no_tta", action="store_true")
+    parser.add_argument("--output_csv", type=str, default="", help="Output csv path.")
+    args = parser.parse_args()
 
-    if args.stage is not None:
-        config.CURRENT_STAGE = args.stage
-    if args.image_size is not None and args.image_size != config.IMAGE_SIZE:
-        print(f"[Warn] Override IMAGE_SIZE from {config.IMAGE_SIZE} -> {args.image_size}")
-        config.IMAGE_SIZE = args.image_size
-    
-    # --- 1. 确定 OOF 文件 ---
-    oof_files = []
-    if args.oof_paths:
-        for p in args.oof_paths:
-            oof_files.extend(glob.glob(p))
-    else:
-        # 默认去 config 目录找
-        oof_files.extend(glob.glob(os.path.join(config.OOF_DIR, 'oof_fold_*.csv')))
+    thr = 0.5
+    if args.threshold is not None:
+        thr = float(args.threshold)
+    elif args.threshold_json:
+        with open(args.threshold_json, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        thr = float(j.get("best_threshold", j.get("threshold", 0.5)))
 
-    oof_files = sorted(oof_files)
-    best_threshold = None
-    if not args.only_eval:
-        best_threshold = _load_solid_threshold()
-        if best_threshold is not None:
-            print(f"[Info] 使用固化阈值 output/best_threshold.json: {best_threshold:.4f}")
+    ckpt_input = args.ckpt or config.CURRENT_RUN_MODELS_DIR
+    ckpts = resolve_ckpts(ckpt_input, args.pattern, args.select, args.avg_last_k)
+    models = [load_model_from_ckpt(p) for p in ckpts]
 
-    if best_threshold is None:
-        if not oof_files:
-            print(f"⚠️  警告: 未找到 OOF 文件，将使用默认阈值 0.5。请检查 {config.OOF_DIR}")
-            best_threshold = 0.5
-        else:
-            print(f"[Info] 加载 {len(oof_files)} 个 OOF 文件进行阈值搜索...")
-            probs, targets = load_oof(oof_files)
-            if len(targets) == 0:
-                print("⚠️  OOF文件为空，使用默认阈值0.5")
-                best_threshold = 0.5
-            else:
-                best_threshold = search_best_threshold(probs, targets)
-                if not args.only_eval:
-                    _save_solid_threshold(best_threshold, oof_files)
+    _, _, test_tf = get_transforms()
+    ds = MedicalDataset(root_dir=config.UNLABELED_TEST_DIR, mode="test", transform=test_tf)
+    dl = DataLoader(ds, batch_size=max(1, config.BATCH_SIZE), shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True)
 
-    # === [核心逻辑] 如果只是评测，到这里就结束 ===
-    if args.only_eval:
-        print("✅ 评测完成 (--only_eval)。不执行推理提交。")
-        return
+    names, probs = predict_probs(models, dl, tta=(not args.no_tta))
+    preds = (probs >= thr).astype(np.int64)
 
-    # --- 2. 正式推理流程 ---
-    model_files = []
-    for path_pattern in args.model_paths:
-        model_files.extend(glob.glob(path_pattern))
+    df = pd.DataFrame({"name": names, "label": preds})
+    out_csv = args.output_csv or os.path.join(config.OUTPUT_DIR, f"submission_{config.RUN_ID}.csv")
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    print(f"saved: {out_csv}")
+    print(f"ckpts: {len(ckpts)} thr={thr:.3f} tta={not args.no_tta}")
 
-    if not model_files:
-        print(f"❌ Error: No model files found matching: {args.model_paths}")
-        return
-    
-    print(f"🚀 开始执行推理，使用 {len(model_files)} 个模型...")
-    print(f"📌 使用阈值: {best_threshold:.4f}")
 
-    test_transform = build_test_transform()
-    dataset = MedicalDataset(config.UNLABELED_TEST_DIR, mode='test', transform=test_transform)
-    loader = DataLoader(dataset, batch_size=config.BATCH_SIZE * 2, shuffle=False, num_workers=4)
-
-    # 加载模型
-    models = []
-    for path in model_files:
-        print(f"  -> Loading {os.path.basename(path)}")
-        m = get_model(config.MODEL_NAME, num_classes=config.NUM_CLASSES, pretrained=False)
-        try:
-            state_dict = torch.load(path, map_location=config.DEVICE, weights_only=True)
-        except TypeError:
-            state_dict = torch.load(path, map_location=config.DEVICE)
-        
-        if isinstance(state_dict, dict) and state_dict and next(iter(state_dict.keys())).startswith('module.'):
-            state_dict = {k[7:]: v for k, v in state_dict.items()}
-        m.load_state_dict(state_dict)
-        m.to(config.DEVICE)
-        m.eval()
-        models.append(m)
-
-    shift_tta = int(os.environ.get('SHIFT_TTA', '0')) == 1
-    shift_px = int(os.environ.get('SHIFT_PX', '8'))
-
-    # 推理
-    predictions = []
-    print("\nRunning inference on unlabeled test set (TTA: identity + hflip{} )...".format(" + shift" if shift_tta else ""))
-    with torch.no_grad():
-        for images, filenames in tqdm(loader):
-            images = images.to(config.DEVICE)
-
-            prob_sum = torch.zeros(images.size(0), device=config.DEVICE)
-            tta_views = tta_2x(images)
-            if shift_tta:
-                shift_views = tta_shift(images, shift_px)
-                tta_views.extend(shift_views)
-                tta_views.extend([torch.flip(v, dims=[3]) for v in shift_views])
-            denom = float(len(models) * len(tta_views))
-
-            for model in models:
-                for view in tta_views:
-                    logits = model(view)
-                    prob_sum += torch.sigmoid(logits)
-
-            avg_prob = (prob_sum / denom).detach().cpu().numpy()
-            final_preds = (avg_prob >= best_threshold).astype(np.int64)
-
-            for fname, label in zip(filenames, final_preds):
-                predictions.append({"id": fname, "label": int(label)})
-
-    # 保存
-    submission_df = pd.DataFrame(predictions)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    submission_filename = f"submission_{timestamp}.csv"
-    submission_path = os.path.join(config.OUTPUT_DIR, submission_filename)
-
-    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    submission_df.to_csv(submission_path, index=False)
-    
-    print(f"\n🎉 Submission file created: {submission_path}")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
