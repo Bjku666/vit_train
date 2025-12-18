@@ -103,6 +103,7 @@ def predict_probs(models: List[torch.nn.Module], loader: DataLoader, tta: bool =
         probs = (prob_sum / denom).detach().cpu().numpy()
         probs_out.append(probs)
         filenames.extend(list(names))
+
     return filenames, np.concatenate(probs_out)
 
 
@@ -118,16 +119,45 @@ def main():
     parser.add_argument("--output_csv", type=str, default="", help="输出 CSV 路径")
     args = parser.parse_args()
 
-    thr = 0.5
-    if args.threshold is not None:
-        thr = float(args.threshold)
-    elif args.threshold_json:
-        with open(args.threshold_json, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        thr = float(j.get("best_threshold", j.get("threshold", 0.5)))
-
     ckpt_input = args.ckpt or config.CURRENT_RUN_MODELS_DIR
     ckpts = resolve_ckpts(ckpt_input, args.pattern, args.select, args.avg_last_k)
+
+    # 依次尝试：CLI 阈值 > meta.json 的 best_thr > 兜底 0.5
+    meta = {}
+    meta_path = ""
+    meta_candidates = []
+    if args.threshold_json:
+        meta_candidates.append(args.threshold_json)
+
+    ckpt_dirs = sorted({os.path.dirname(p) or "." for p in ckpts})
+    for d in ckpt_dirs:
+        meta_candidates.extend(sorted(glob.glob(os.path.join(d, f"*stage{config.CURRENT_STAGE}_meta.json"))))
+        meta_candidates.extend(sorted(glob.glob(os.path.join(d, "*_meta.json"))))
+
+    for mp in meta_candidates:
+        try:
+            with open(mp, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            meta_path = mp
+            break
+        except FileNotFoundError:
+            continue
+        except json.JSONDecodeError:
+            print(f"[Meta] Failed to parse: {mp}")
+            continue
+
+    meta_thr = meta.get("best_thr") if isinstance(meta, dict) else None
+    if args.threshold is not None:
+        thr = float(args.threshold)
+        print(f"[Thr] Using CLI threshold={thr}")
+    elif meta_thr is not None:
+        thr = float(meta_thr)
+        src = meta_path or "meta"
+        print(f"[Thr] Using meta best_thr={thr} (source={src})")
+    else:
+        thr = 0.5
+        print("[Thr] Using fallback threshold=0.5")
+
     models = [load_model_from_ckpt(p) for p in ckpts]
 
     _, _, test_tf = get_transforms()

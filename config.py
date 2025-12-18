@@ -38,8 +38,10 @@ if INIT_OUTPUT_DIRS:
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# OOF 目录仅在需要时创建（默认关闭）
 OOF_DIR = os.path.join(OUTPUT_DIR, "oof")
-if INIT_OUTPUT_DIRS:
+CREATE_OOF_DIR = os.environ.get("CREATE_OOF", "0").lower() in ["1", "true", "yes", "y"]
+if INIT_OUTPUT_DIRS and CREATE_OOF_DIR:
     os.makedirs(OOF_DIR, exist_ok=True)
 
 

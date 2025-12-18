@@ -36,6 +36,16 @@ read -p "GPU_ID [default 0]: " GPU_ID
 GPU_ID=${GPU_ID:-0}
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
+echo "===================================="
+read -p "Input threshold (press Enter to use default): " USER_THR
+if [ -n "$USER_THR" ]; then
+  export THRESHOLD="$USER_THR"
+  echo "[Submit] Using user-specified threshold = $THRESHOLD"
+else
+  export THRESHOLD=""
+  echo "[Submit] Using default threshold from checkpoint"
+fi
+
 # ---- select checkpoint
 echo "----------------------------------------"
 echo "Choose checkpoint:"
@@ -82,6 +92,11 @@ echo "----------------------------------------"
 # ---- run inference
 # 你当前版本应该已经没有 benchmark / pseudo 逻辑了，所以 inference.py 只负责：
 #   读取测试集 -> 推理 -> 输出 submission.csv
-python inference.py --ckpt "${CKPT}" --output_csv "${OUTPUT_CSV}"
+EXTRA_ARGS=(--ckpt "${CKPT}" --output_csv "${OUTPUT_CSV}")
+if [ -n "${THRESHOLD}" ]; then
+  EXTRA_ARGS+=(--threshold "${THRESHOLD}")
+fi
+
+python inference.py "${EXTRA_ARGS[@]}"
 
 echo "Done. Check output/ for submission csv."
