@@ -95,7 +95,7 @@ def search_best_threshold(probs: np.ndarray, targets: np.ndarray) -> float:
     return best_t
 
 
-def _load_solid_threshold() -> float | None:
+def _load_solid_threshold():
     """从 output/best_threshold.json 读取固化阈值（由训练/评测脚本写入）。"""
     path = os.path.join(config.OUTPUT_DIR, 'best_threshold.json')
     if not os.path.exists(path):
