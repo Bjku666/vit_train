@@ -15,6 +15,7 @@ models/
 logs/
 output/
 rub/
+rub2/
 *.log
 *.csv
 *.json

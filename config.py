@@ -1,95 +1,95 @@
 import os
 from datetime import datetime
 import torch
-
 # =============================
-# Paths
+# 路径配置
 # =============================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# =============================
+# RETFound（仅用于 ViT 主干）
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
 DATA_DIR = os.path.join(BASE_DIR, "data")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
-LOG_DIR = os.path.join(BASE_DIR, "logs")
+# 运行 / 阶段
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-PRETRAINED_DIR = os.path.join(BASE_DIR, "pretrained")
+# 注意：benchmark/inference 默认不应创建目录
 
 # RETFound (only used for ViT backbones)
 RETFOUND_PATH = os.path.join(PRETRAINED_DIR, "RETFound_cfp_weights.pth")
-
 # =============================
-# Run / stage
+# 数据目录
 # =============================
-RUN_ID = os.environ.get("RUN_ID", "").strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
+# =============================
+# 有标签训练集：期望结构 data/2-MedImage-TrainSet/{disease,normal}/*.jpg
 CURRENT_STAGE = int(os.environ.get("CURRENT_STAGE", "1"))
-
+# 可选伪标签集（默认关闭）
 CURRENT_RUN_MODELS_DIR = os.path.join(MODELS_DIR, f"run_{RUN_ID}")
 CURRENT_LOG_DIR = os.path.join(LOG_DIR, RUN_ID)
 TEXT_LOG_FILE = os.path.join(LOG_DIR, f"train_{RUN_ID}.log")
-
-# IMPORTANT: benchmark/inference should not create folders by default
-INIT_OUTPUT_DIRS = os.environ.get("CONFIG_INIT_DIRS", "1") == "1"
+# =============================
+# 模型
+# =============================
 if INIT_OUTPUT_DIRS:
-    os.makedirs(CURRENT_RUN_MODELS_DIR, exist_ok=True)
+# 在此切换主干：
     os.makedirs(CURRENT_LOG_DIR, exist_ok=True)
-    os.makedirs(LOG_DIR, exist_ok=True)
+# - Swin（推荐基线）：swin_base_patch4_window12_384
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-
+# - ViT（RETFound）：vit_base_patch16_384 / vit_large_patch16_384 ...
 OOF_DIR = os.path.join(OUTPUT_DIR, "oof")
-if INIT_OUTPUT_DIRS:
+# 二分类，BCEWithLogitsLoss，对应输出 1 个 logit
     os.makedirs(OOF_DIR, exist_ok=True)
-
+# 可选：使用 GeM 池化（适用于 ViT 类 token 模型）
 # =============================
 # Data dirs
 # =============================
-# Labeled train set: expect subfolders like data/2-MedImage-TrainSet/{disease,normal}/*.jpg
-LABELED_TRAIN_DIR = os.path.join(DATA_DIR, "2-MedImage-TrainSet")
-LABELED_TEST_DIR = os.path.join(DATA_DIR, "2-MedImage-TestSet")  # labeled testset (for local benchmarking)
+# =============================
+# 划分策略
+# =============================
 UNLABELED_TEST_DIR = os.path.join(DATA_DIR, "MedImage-TestSet")  # unlabeled testset (for submission / pseudo label)
-
+# 目前默认单划分，可切换 KFold。
 # Optional pseudo-labeled set (disabled by default)
 USE_PSEUDO_LABELS = os.environ.get("USE_PSEUDO_LABELS", "0").lower() in ["1", "true", "yes", "y"]
 PSEUDO_LABELED_DIR = os.path.join(DATA_DIR, "pseudo_labeled_set")
-
-TRAIN_DIRS = [LABELED_TRAIN_DIR]
-if USE_PSEUDO_LABELS and os.path.exists(PSEUDO_LABELED_DIR):
-    TRAIN_DIRS.append(PSEUDO_LABELED_DIR)
-
 # =============================
-# Model
+# 训练基础参数
+# =============================
+    TRAIN_DIRS.append(PSEUDO_LABELED_DIR)
+# 渐进式分辨率
+# =============================
+    # Stage2 微调用的 solver
 # =============================
 # Switch backbone here:
 # - Swin (recommended baseline): swin_base_patch4_window12_384
-# - ViT (RETFound): vit_base_patch16_384 / vit_large_patch16_384 ...
-MODEL_NAME = os.environ.get("MODEL_NAME", "swin_base_patch4_window12_384")
-
+# =============================
+# LLRD / Stage2 冻结配置
+# =============================
 # Binary classification with BCEWithLogitsLoss -> output 1 logit
-NUM_CLASSES = 1
+# 冻结→解冻（Stage2）
 
-# Optional: use GeM pooling (only for ViT-style token models)
+# 对 ViT：冻结前 N 个 block；对 Swin：可按 stage/block 冻结前段。
 USE_GEM = os.environ.get("USE_GEM", "0").lower() in ["1", "true", "yes", "y"]
 
 # =============================
-# Split strategy
 # =============================
-# You said you want to keep a single split instead of k-fold.
+# EMA
+# =============================
 USE_KFOLD = os.environ.get("USE_KFOLD", "0").lower() in ["1", "true", "yes", "y"]
-N_SPLITS = int(os.environ.get("N_SPLITS", "5"))
+# Mixup（可选，建议适度以免影响边界）
 VAL_RATIO = float(os.environ.get("VAL_RATIO", "0.2"))
 
 # =============================
-# Training basics
 # =============================
-SEED = int(os.environ.get("SEED", "42"))
+# 图像归一化
+# =============================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "8"))
+# 预处理开关（Ben Graham / CLAHE）
 
 # Progressive resizing
 if CURRENT_STAGE == 1:
-    IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "384"))
-    EPOCHS = int(os.environ.get("EPOCHS", "10"))
-    BASE_LR = float(os.environ.get("BASE_LR", "2e-5"))  # Swin/Vit-base friendly
+# =============================
+# 检查点
+# =============================
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
-    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
+# 每个 epoch 保存，便于后续尝试“非最佳”权重。
 else:
     IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "512"))
     EPOCHS = int(os.environ.get("EPOCHS", "8"))

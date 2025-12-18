@@ -53,3 +53,16 @@ CONFIG_INIT_DIRS=0 SHIFT_TTA=1 SHIFT_PX=8 python inference.py \
 - 评测结果：`output/benchmark_result_*.json`。
 - 提交文件：`output/submission_*.csv`。
 - 伪标签：`data/pseudo_labeled_set/`。
+
+
+## Download Swin pretrained weights
+
+Option A (recommended): let `timm` download automatically by using `pretrained=True`.
+
+Option B (manual):
+
+```bash
+cd pretrained
+./download_swin_weights.sh
+```
+

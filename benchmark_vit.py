@@ -1,10 +1,10 @@
 """benchmark_vit.py
 
-Evaluate checkpoints on a labeled set (default: config.LABELED_TEST_DIR).
-Supports:
-- single-split: evaluate one checkpoint OR sweep multiple epochs
-- kfold: pass multiple checkpoints and average probs
-- TTA: identity + hflip (2x)
+在有标签数据集上评测权重（默认使用 config.LABELED_TEST_DIR）。
+支持：
+- 单划分：评测单个权重或多 epoch 扫描
+- KFold：传入多个权重并对概率求均值
+- TTA：原图 + 水平翻转（2x）
 """
 
 import argparse
@@ -47,7 +47,7 @@ def confusion(labels: np.ndarray, probs: np.ndarray, thr: float):
 
 
 def load_model_from_ckpt(ckpt_path: str) -> torch.nn.Module:
-    # Build model from current config (ensure MODEL_NAME/IMAGE_SIZE are correct in your env)
+    # 按当前配置构建模型（确保环境中 MODEL_NAME/IMAGE_SIZE 一致）
     model = get_model().to(config.DEVICE)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
@@ -85,21 +85,21 @@ def predict_probs(models: List[torch.nn.Module], loader: DataLoader, tta: bool =
 
 
 def resolve_ckpts(ckpt_input: str, pattern: str, select: str, avg_last_k: int) -> List[str]:
-    # If input is a file, just use it
+    # 若输入是文件，直接使用
     if os.path.isfile(ckpt_input):
         return [ckpt_input]
 
-    # If input is a dir, glob inside
+    # 若输入是目录，则在目录内 glob
     if os.path.isdir(ckpt_input):
         ckpts = sorted(glob.glob(os.path.join(ckpt_input, pattern)))
     else:
-        # treat as glob
+        # 直接按 glob 模式处理
         ckpts = sorted(glob.glob(ckpt_input))
 
     if len(ckpts) == 0:
         raise FileNotFoundError(f"No checkpoints found for: {ckpt_input} (pattern={pattern})")
 
-    # selection
+    # 选择策略
     s = (select or "").lower().strip()
     if s.startswith("epoch:"):
         e = int(s.split("epoch:")[1])
@@ -112,7 +112,7 @@ def resolve_ckpts(ckpt_input: str, pattern: str, select: str, avg_last_k: int) -
         hit = [p for p in ckpts if p.endswith("_best.pth") or "best.pth" in os.path.basename(p)]
         if hit:
             return hit[:1]
-        # fallback: last
+        # 回退：使用最后一个
         return [ckpts[-1]]
 
     if s == "last":
@@ -121,7 +121,7 @@ def resolve_ckpts(ckpt_input: str, pattern: str, select: str, avg_last_k: int) -
     if avg_last_k > 1:
         return ckpts[-avg_last_k:]
 
-    # default: use all (ensemble) if multiple provided
+    # 默认：全部使用（集成）
     return ckpts
 
 

@@ -1,9 +1,9 @@
 """inference.py
 
-Generate submission CSV for the unlabeled test set.
-- Supports selecting checkpoints by epoch/best/last
-- Supports averaging last K epochs (cheap SWA-style ensemble)
-- Uses sigmoid (binary logit) and a threshold
+为无标签测试集生成提交 CSV。
+- 支持按 epoch/best/last 选择权重
+- 支持对最后 K 个 epoch 做均值（简易 SWA 集成）
+- 使用 sigmoid（二分类 logit）与阈值输出
 """
 
 import argparse
@@ -76,7 +76,7 @@ def predict_probs(models: List[torch.nn.Module], loader: DataLoader, tta: bool =
         prob_sum = torch.zeros(images.size(0), device=config.DEVICE, dtype=torch.float32)
         views = [images]
         if tta:
-            views.append(torch.flip(images, dims=[3]))  # hflip
+            views.append(torch.flip(images, dims=[3]))  # 水平翻转
         denom = len(models) * len(views)
 
         for v in views:

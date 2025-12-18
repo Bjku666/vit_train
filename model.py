@@ -11,7 +11,7 @@ import config
 
 
 class GeM(nn.Module):
-    """Generalized Mean Pooling (works for feature maps BxCxHxW)."""
+    """广义均值池化（适用于形状 BxCxHxW 的特征图）。"""
     def __init__(self, p: float = 3.0, eps: float = 1e-6):
         super().__init__()
         self.p = nn.Parameter(torch.ones(1) * p)
@@ -25,9 +25,9 @@ class GeM(nn.Module):
 
 
 class RETFoundViTGeM(nn.Module):
-    """RETFound ViT backbone + token->2D reshape + GeM pooling + linear head.
+    """RETFound ViT 主干 + token 还原 2D + GeM 池化 + 线性头。
 
-    Works only for timm ViT models that expose:
+    仅适用于暴露以下模块的 timm ViT：
     - patch_embed, cls_token, pos_embed, pos_drop, blocks, norm
     """
     def __init__(self, backbone: nn.Module, num_classes: int = 1):
@@ -40,10 +40,10 @@ class RETFoundViTGeM(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # patch embedding (B,C,H,W)->(B,N,D)
         x = self.backbone.patch_embed(x)
-        # add cls token
+        # 添加 cls token
         cls_token = self.backbone.cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_token, x), dim=1)
-        # pos embed (+ drop)
+        # 位置编码（含 dropout）
         x = x + self.backbone.pos_embed
         x = self.backbone.pos_drop(x)
         # transformer blocks + norm
@@ -51,12 +51,12 @@ class RETFoundViTGeM(nn.Module):
             x = blk(x)
         x = self.backbone.norm(x)
 
-        # drop CLS, reshape patch tokens to (B,D,h,w)
+        # 去除 CLS，将 patch token 还原为 (B,D,h,w)
         x = x[:, 1:, :]  # (B, N, D)
         B, N, D = x.shape
         h = w = int(math.sqrt(N))
         if h * w != N:
-            # fallback: treat as 1D tokens -> mean
+            # 回退：无法整平方则做 1D 平均
             feat = x.mean(dim=1)
         else:
             x = x.transpose(1, 2).reshape(B, D, h, w)
@@ -66,7 +66,7 @@ class RETFoundViTGeM(nn.Module):
 
 
 class TimmBinaryClassifier(nn.Module):
-    """Generic timm backbone (features) + linear head. Adds .backbone and .head for LLRD/freeze."""
+    """通用 timm 主干（features）+ 线性头，并挂载 .backbone/.head 以支持 LLRD/冻结。"""
     def __init__(self, backbone: nn.Module, num_classes: int = 1):
         super().__init__()
         self.backbone = backbone
@@ -76,12 +76,12 @@ class TimmBinaryClassifier(nn.Module):
         self.head = nn.Linear(feat_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Most timm models support forward_features
+        # 大多数 timm 模型支持 forward_features
         if hasattr(self.backbone, "forward_features"):
             feat = self.backbone.forward_features(x)
         else:
             feat = self.backbone(x)
-        # Some models return (B, C, H, W); pool if needed
+        # 部分模型返回 (B, C, H, W)，需要做池化
         if feat.dim() == 4:
             feat = feat.mean(dim=(-2, -1))
         out = self.head(feat)
@@ -101,7 +101,7 @@ def _load_checkpoint(path: str) -> dict:
 
 
 def _interpolate_pos_embed(vit: nn.Module, checkpoint_model: dict) -> dict:
-    """Interpolate ViT pos_embed to match current model resolution."""
+    """对 ViT 的位置编码做插值以匹配当前分辨率。"""
     pos_embed_key = "pos_embed"
     if not (hasattr(vit, "pos_embed") and pos_embed_key in checkpoint_model):
         return checkpoint_model
@@ -116,15 +116,15 @@ def _interpolate_pos_embed(vit: nn.Module, checkpoint_model: dict) -> dict:
     num_patches = vit.patch_embed.num_patches
     num_extra_tokens = vit.pos_embed.shape[-2] - num_patches
 
-    # class token and others
+    # class token 及其他额外 token
     extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
     pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
 
-    # old grid
+    # 旧网格尺寸
     old_grid = int(math.sqrt(pos_tokens.shape[1]))
     new_grid = int(math.sqrt(num_patches))
     if old_grid * old_grid != pos_tokens.shape[1]:
-        return checkpoint_model  # can't infer, skip
+        return checkpoint_model  # 无法推断则跳过
 
     pos_tokens = pos_tokens.reshape(1, old_grid, old_grid, embedding_size).permute(0, 3, 1, 2)
     pos_tokens = torch.nn.functional.interpolate(pos_tokens, size=(new_grid, new_grid), mode="bicubic", align_corners=False)
@@ -136,13 +136,13 @@ def _interpolate_pos_embed(vit: nn.Module, checkpoint_model: dict) -> dict:
 
 
 def load_retfound_weights(vit_backbone: nn.Module, weight_path: str) -> Tuple[int, int]:
-    """Load RETFound weights into a ViT backbone (strict=False). Returns (missing, unexpected) counts."""
+    """将 RETFound 权重加载到 ViT 主干（strict=False），返回 missing/unexpected 数量。"""
     if not os.path.exists(weight_path):
         raise FileNotFoundError(f"RETFound weights not found: {weight_path}")
 
     checkpoint_model = _load_checkpoint(weight_path)
 
-    # interpolate pos_embed if needed
+    # 如有需要对 pos_embed 插值
     checkpoint_model = _interpolate_pos_embed(vit_backbone, checkpoint_model)
 
     msg = vit_backbone.load_state_dict(checkpoint_model, strict=False)
@@ -155,10 +155,10 @@ def get_model() -> nn.Module:
     name = config.MODEL_NAME.lower()
 
     # -----------------------------
-    # Swin / ConvNeXt / etc (ImageNet pretrained by default)
+    # Swin / ConvNeXt 等（默认 ImageNet 预训练）
     # -----------------------------
     if "swin" in name:
-        # Build backbone without classifier head
+        # 构建去掉分类头的主干
         backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0)
         model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
         print(f"[Model] Swin backbone: {config.MODEL_NAME} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
@@ -168,9 +168,9 @@ def get_model() -> nn.Module:
     # ViT (RETFound)
     # -----------------------------
     if "vit" in name:
-        # Create timm ViT backbone without classifier head
+        # 创建不带分类头的 timm ViT 主干
         backbone = timm.create_model(config.MODEL_NAME, pretrained=False, num_classes=0)
-        # Load RETFound weights
+        # 加载 RETFound 权重
         missing, unexpected = load_retfound_weights(backbone, config.RETFOUND_PATH)
 
         if config.USE_GEM:
@@ -181,7 +181,7 @@ def get_model() -> nn.Module:
             print(f"[Model] RETFound ViT | {config.MODEL_NAME} | img={config.IMAGE_SIZE} | missing={missing} unexpected={unexpected}")
         return model
 
-    # Fallback: any timm model
+    # 回退：任意 timm 模型
     backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0)
     model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
     print(f"[Model] timm backbone: {config.MODEL_NAME} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")

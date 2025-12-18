@@ -1,13 +1,13 @@
 """train_vit.py
 
-Single-split (default) + optional KFold training script.
+单划分（默认）+ 可选 KFold 的训练脚本。
 
-Goals for this repo (your current strategy):
-- Binary classification (0/1), leaderboard metric = Accuracy
-- Support Swin (recommended) and RETFound-ViT backbones
-- Stage1/Stage2 progressive resizing via config.CURRENT_STAGE
-- "Non-best epoch can work better": save checkpoints every epoch + allow easy selection later
-- Optional: LLRD + freeze->unfreeze for Stage2 stability
+当前策略目标：
+- 二分类（0/1），榜单指标为 Accuracy
+- 支持 Swin（推荐）与 RETFound-ViT 主干
+- 通过 config.CURRENT_STAGE 控制 Stage1/Stage2 渐进分辨率
+- “非最优 epoch 也可能更好”：每个 epoch 都存权重，便于后续挑选
+- 可选：Stage2 使用 LLRD + 冻结→解冻 提升稳定性
 """
 
 import argparse
@@ -36,7 +36,7 @@ from model import get_model
 
 
 # -----------------------------
-# Utils
+# 工具函数
 # -----------------------------
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -55,9 +55,9 @@ def sigmoid_np(x: np.ndarray) -> np.ndarray:
 
 
 def search_best_threshold(probs: np.ndarray, labels: np.ndarray) -> Tuple[float, float]:
-    """Return (best_thr, best_acc)."""
+    """返回 (最佳阈值, 对应准确率)。"""
     best_thr, best_acc = 0.5, -1.0
-    # coarse->fine search
+    # 由粗到细的栅格搜索
     for thr in np.linspace(0.2, 0.8, 121):
         pred = (probs >= thr).astype(np.int64)
         acc = (pred == labels).mean()
@@ -76,7 +76,7 @@ def confusion_from_probs(probs: np.ndarray, labels: np.ndarray, thr: float) -> T
 
 
 def gather_image_paths_and_labels(root_dirs) -> Tuple[List[str], List[int]]:
-    """Scan dirs for images. Label is determined by parent folder name: disease=1, else 0."""
+    """遍历目录收集图像，标签由父目录名决定：disease=1，否则为0。"""
     if isinstance(root_dirs, (list, tuple)):
         roots = root_dirs
     else:
@@ -94,7 +94,7 @@ def gather_image_paths_and_labels(root_dirs) -> Tuple[List[str], List[int]]:
                     y = 1 if parent == "disease" else 0
                     paths.append(p)
                     labels.append(y)
-    # stable ordering
+    # 保持稳定的排序
     order = np.argsort(paths)
     paths = [paths[i] for i in order]
     labels = [labels[i] for i in order]
@@ -102,7 +102,7 @@ def gather_image_paths_and_labels(root_dirs) -> Tuple[List[str], List[int]]:
 
 
 # -----------------------------
-# LLRD (supports ViT blocks / Swin layers.blocks)
+# LLRD（支持 ViT blocks / Swin layers.blocks）
 # -----------------------------
 def _is_no_decay(name: str, p: nn.Parameter) -> bool:
     if not p.requires_grad:
@@ -118,12 +118,12 @@ def _is_no_decay(name: str, p: nn.Parameter) -> bool:
 def _get_backbone_and_head(model: nn.Module) -> Tuple[nn.Module, nn.Module]:
     m = model.module if isinstance(model, nn.DataParallel) else model
     if not hasattr(m, "backbone") or not hasattr(m, "head"):
-        raise RuntimeError("Model must have .backbone and .head for LLRD/freeze")
+        raise RuntimeError("模型需要同时具备 .backbone 与 .head 以支持 LLRD/冻结")
     return m.backbone, m.head
 
 
 def _build_block_id_map_for_swin(backbone: nn.Module) -> Tuple[Dict[Tuple[int, int], int], int]:
-    """Map (stage, block) -> global_id; return (map, total_blocks)."""
+    """将 (stage, block) 映射为全局序号，返回映射与总块数。"""
     mapping: Dict[Tuple[int, int], int] = {}
     gid = 0
     layers = getattr(backbone, "layers", None)
@@ -140,22 +140,22 @@ def _build_block_id_map_for_swin(backbone: nn.Module) -> Tuple[Dict[Tuple[int, i
 
 
 def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: float, layer_decay: float) -> List[Dict]:
-    """Create param groups for LLRD.
+    """构建 LLRD 参数组。
 
-    - For ViT: backbone.blocks.{i}
-    - For Swin: backbone.layers.{stage}.blocks.{block}
+    - 对 ViT：backbone.blocks.{i}
+    - 对 Swin：backbone.layers.{stage}.blocks.{block}
     """
     backbone, head = _get_backbone_and_head(model)
 
-    # Detect ViT
+    # 检测 ViT
     vit_blocks = getattr(backbone, "blocks", None)
     is_vit = vit_blocks is not None
 
-    # Detect Swin
+    # 检测 Swin
     swin_layers = getattr(backbone, "layers", None)
     is_swin = (not is_vit) and (swin_layers is not None)
 
-    # Count layers (flattened blocks)
+    # 统计层数（展平成块序号）
     if is_vit:
         num_layers = len(vit_blocks)
         def layer_id_from_name(n: str) -> int:
@@ -179,7 +179,7 @@ def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: f
                     return -1
             return -1
     else:
-        # fallback: no LLRD, single group
+        # 回退：不做 LLRD，单一参数组
         return [{"params": [p for p in model.parameters() if p.requires_grad], "lr": base_lr, "weight_decay": weight_decay}]
 
     groups: Dict[Tuple[int, bool], Dict] = {}
@@ -194,13 +194,13 @@ def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: f
             }
         groups[key]["params"].append(p)
 
-    # Assign params
+    # 分配参数到各组
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
         no_decay = _is_no_decay(n, p)
 
-        # head: always max lr
+        # head 始终使用最大 lr
         if n.startswith("head.") or ".head." in n:
             add_param(num_layers - 1, no_decay, p, base_lr)
             continue
@@ -210,11 +210,11 @@ def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: f
             scale = layer_decay ** (num_layers - 1 - lid)
             add_param(lid, no_decay, p, base_lr * scale)
         else:
-            # embeddings / patch_embed / pos_embed get the smallest lr
+            # embeddings / patch_embed / pos_embed 采用最小 lr
             scale = layer_decay ** num_layers
             add_param(-1, no_decay, p, base_lr * scale)
 
-    # Print min/max lr for sanity
+    # 打印最小/最大学习率用于校验
     lrs = [g["lr"] for g in groups.values()]
     if len(lrs) > 0:
         print(f"[LLRD] param_groups={len(groups)} min_lr={min(lrs):.2e} max_lr={max(lrs):.2e}")
@@ -223,7 +223,7 @@ def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: f
 
 
 # -----------------------------
-# Freeze utilities
+# 冻结相关工具
 # -----------------------------
 def set_requires_grad(module: nn.Module, flag: bool) -> None:
     for p in module.parameters():
@@ -231,10 +231,10 @@ def set_requires_grad(module: nn.Module, flag: bool) -> None:
 
 
 def apply_stage2_freeze(model: nn.Module) -> None:
-    """Freeze early layers for stage2 warm-start."""
+    """在 Stage2 先冻结前层，便于 warm-start。"""
     backbone, _ = _get_backbone_and_head(model)
 
-    # Freeze patch embed (both ViT and Swin expose patch_embed in timm)
+    # 冻结 patch embed（timm 的 ViT/Swin 都提供 patch_embed）
     if config.FREEZE_PATCH_EMBED_STAGE2 and hasattr(backbone, "patch_embed"):
         set_requires_grad(backbone.patch_embed, False)
 
@@ -247,7 +247,7 @@ def apply_stage2_freeze(model: nn.Module) -> None:
         print(f"[Freeze] ViT: froze patch_embed={config.FREEZE_PATCH_EMBED_STAGE2}, blocks[:{n_freeze}]")
         return
 
-    # Swin layers.blocks (freeze by flattened block index)
+    # Swin layers.blocks（按展平后的块序号冻结）
     if hasattr(backbone, "layers"):
         mapping, total = _build_block_id_map_for_swin(backbone)
         n_freeze = min(config.FREEZE_BLOCKS_BEFORE_STAGE2, total)
@@ -267,7 +267,7 @@ def unfreeze_all(model: nn.Module) -> None:
 
 
 # -----------------------------
-# Train / eval loops
+# 训练 / 验证循环
 # -----------------------------
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -294,7 +294,7 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optimizer, criterion, 
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True).float()
 
-        # Optional mixup (binary soft labels)
+        # 可选 Mixup（二值软标签）
         if use_mixup and np.random.rand() < config.MIXUP_PROB:
             lam = np.random.beta(config.MIXUP_ALPHA, config.MIXUP_ALPHA)
             index = torch.randperm(images.size(0), device=images.device)
@@ -348,7 +348,7 @@ def run_single_split(init_ckpt: str = "") -> None:
     ensure_dir(config.CURRENT_RUN_MODELS_DIR)
     ensure_dir(config.CURRENT_LOG_DIR)
 
-    # Logging
+    # 日志配置
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -361,7 +361,7 @@ def run_single_split(init_ckpt: str = "") -> None:
 
     writer = SummaryWriter(log_dir=config.CURRENT_LOG_DIR)
 
-    # Build dataset list + split
+    # 构建数据列表并划分
     all_paths, all_labels = gather_image_paths_and_labels(config.TRAIN_DIRS)
     y = np.array(all_labels)
 
@@ -375,12 +375,12 @@ def run_single_split(init_ckpt: str = "") -> None:
     dl_train = DataLoader(ds_train, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS, pin_memory=True, drop_last=True)
     dl_val = DataLoader(ds_val, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS, pin_memory=True)
 
-    # Model
+    # 构建模型
     model = get_model().to(config.DEVICE)
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    # Optional warm-start
+    # 可选 warm-start
     if init_ckpt:
         logger.info(f"[Init] Loading init checkpoint: {init_ckpt}")
         ckpt = torch.load(init_ckpt, map_location="cpu")
@@ -388,7 +388,7 @@ def run_single_split(init_ckpt: str = "") -> None:
         msg = (model.module if isinstance(model, nn.DataParallel) else model).load_state_dict(sd, strict=False)
         logger.info(f"[Init] missing={len(getattr(msg,'missing_keys',[]))} unexpected={len(getattr(msg,'unexpected_keys',[]))}")
 
-    # Stage2 freeze
+    # Stage2 冻结
     if config.CURRENT_STAGE == 2 and config.FREEZE_EPOCHS_STAGE2 > 0:
         apply_stage2_freeze(model)
 
@@ -400,7 +400,7 @@ def run_single_split(init_ckpt: str = "") -> None:
     else:
         optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
 
-    # Scheduler: cosine WITHOUT global eta_min (works with LLRD)
+    # 学习率调度：Cosine，无全局 eta_min（兼容 LLRD）
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=0.0)
 
     best_val_acc = -1.0
@@ -410,11 +410,11 @@ def run_single_split(init_ckpt: str = "") -> None:
     prefix = f"{config.MODEL_NAME.replace('/','_')}_stage{config.CURRENT_STAGE}"
 
     for epoch in range(config.EPOCHS):
-        # Unfreeze after freeze epochs
+        # 到期解冻
         if config.CURRENT_STAGE == 2 and epoch == config.FREEZE_EPOCHS_STAGE2:
             unfreeze_all(model)
 
-            # rebuild optimizer param groups now that more params require_grad
+            # 解冻后重建优化器参数组
             if config.USE_LLRD:
                 param_groups = get_optimizer_param_groups(model, base_lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY, layer_decay=config.LAYER_DECAY)
                 optimizer = optim.AdamW(param_groups)
@@ -426,27 +426,27 @@ def run_single_split(init_ckpt: str = "") -> None:
         thr, acc = search_best_threshold(probs, labels)
         tn, fp, fn, tp = confusion_from_probs(probs, labels, thr)
 
-        # log
+        # 日志记录
         writer.add_scalar("loss/train", train_loss, epoch)
         writer.add_scalar("acc/val_bestT", acc, epoch)
         writer.add_scalar("thr/val_bestT", thr, epoch)
         writer.add_scalar("fp/val_bestT", fp, epoch)
         writer.add_scalar("fn/val_bestT", fn, epoch)
 
-        # also log min/max lr
+        # 额外记录最小/最大学习率
         lrs = [g["lr"] for g in optimizer.param_groups]
         writer.add_scalar("lr/min", float(min(lrs)), epoch)
         writer.add_scalar("lr/max", float(max(lrs)), epoch)
 
         logger.info(f"[Epoch {epoch:03d}] loss={train_loss:.4f} val_acc@bestT={acc:.4f} bestT={thr:.3f} CM=[[{tn} {fp}] [{fn} {tp}]] lr=[{min(lrs):.2e},{max(lrs):.2e}]")
 
-        # Save every epoch (so you can choose "non-best")
+        # 每个 epoch 都保存，便于后续挑选“非最佳”权重
         if config.SAVE_EVERY_EPOCH:
             ckpt_path = os.path.join(config.CURRENT_RUN_MODELS_DIR, f"{prefix}_epoch{epoch:03d}.pth")
             save_checkpoint(ckpt_path, model, epoch, extra={"val_acc_bestT": acc, "val_thr": thr, "cm": [tn, fp, fn, tp]})
             maybe_prune_old_ckpts(config.CURRENT_RUN_MODELS_DIR, prefix)
 
-        # Track best on val (still useful)
+        # 仍然跟踪验证集最佳，方便快速定位好模型
         if acc > best_val_acc:
             best_val_acc = acc
             best_epoch = epoch
@@ -457,7 +457,7 @@ def run_single_split(init_ckpt: str = "") -> None:
 
         scheduler.step()
 
-    # Save final metadata json
+    # 保存最终元数据 json
     meta = {
         "run_id": config.RUN_ID,
         "model_name": config.MODEL_NAME,
@@ -478,7 +478,7 @@ def run_single_split(init_ckpt: str = "") -> None:
 
 
 def run_kfold(stage1_models_dir: str = "") -> None:
-    """Optional: keep your old KFold pathway."""
+    """可选：保留旧的 KFold 路径。"""
     set_seed(config.SEED)
     ensure_dir(config.CURRENT_RUN_MODELS_DIR)
     ensure_dir(config.CURRENT_LOG_DIR)
@@ -516,7 +516,7 @@ def run_kfold(stage1_models_dir: str = "") -> None:
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
 
-        # stage2 warm-start: load stage1 fold best
+        # stage2 warm-start：加载对应 fold 的 stage1 最优
         if config.CURRENT_STAGE == 2 and stage1_models_dir:
             cand = os.path.join(stage1_models_dir, f"{prefix}_fold{fold}_best.pth")
             if os.path.exists(cand):
