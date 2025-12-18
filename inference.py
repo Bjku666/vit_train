@@ -144,6 +144,16 @@ def tta_2x(images: torch.Tensor):
     """严格 2x TTA：仅原图 + 水平翻转（不做任何旋转）"""
     return [images, torch.flip(images, dims=[3])]
 
+
+def tta_shift(images: torch.Tensor, shift_px: int):
+    pad = torch.nn.functional.pad(images, (0, 0, 0, 0, shift_px, shift_px, shift_px, shift_px))
+    views = []
+    views.append(pad[:, :, shift_px*2:, shift_px:-shift_px])  # up
+    views.append(pad[:, :, :-shift_px*2, shift_px:-shift_px])  # down
+    views.append(pad[:, :, shift_px:-shift_px, shift_px*2:])  # left
+    views.append(pad[:, :, shift_px:-shift_px, :-shift_px*2])  # right
+    return views
+
 def main():
     args = parse_args()
     
@@ -216,15 +226,21 @@ def main():
         m.eval()
         models.append(m)
 
+    shift_tta = int(os.environ.get('SHIFT_TTA', '0')) == 1
+    shift_px = int(os.environ.get('SHIFT_PX', '8'))
+
     # 推理
     predictions = []
-    print("\nRunning inference on unlabeled test set (2x TTA: identity + hflip)...")
+    print("\nRunning inference on unlabeled test set (TTA: identity + hflip{} )...".format(" + shift" if shift_tta else ""))
     with torch.no_grad():
         for images, filenames in tqdm(loader):
             images = images.to(config.DEVICE)
 
             prob_sum = torch.zeros(images.size(0), device=config.DEVICE)
             tta_views = tta_2x(images)
+            if shift_tta:
+                tta_views.extend(tta_shift(images, shift_px))
+                tta_views.extend([torch.flip(v, dims=[3]) for v in tta_views if v is not images])
             denom = float(len(models) * len(tta_views))
 
             for model in models:

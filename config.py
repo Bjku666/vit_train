@@ -95,6 +95,24 @@ MODEL_NAME = 'vit_large_patch16_384'
 # 二分类：使用 BCEWithLogitsLoss，因此模型输出维度为 1（logit），标签为 0/1 float。
 NUM_CLASSES = 1
 
+# === Stage2 Solver 可配置开关与超参 ===
+# LLRD 开关 + 衰减因子
+USE_LLRD = os.environ.get('USE_LLRD', '1').lower() not in ['0', 'false']
+LAYER_DECAY = float(os.environ.get('LAYER_DECAY', 0.75))
+
+# Stage2 专用 LR/WD（不再用 1e-6“学不动”）
+STAGE2_BASE_LR = float(os.environ.get('STAGE2_BASE_LR', 2e-5))
+STAGE2_WEIGHT_DECAY = float(os.environ.get('STAGE2_WEIGHT_DECAY', 0.1))
+
+# Stage2 冻结→解冻策略
+FREEZE_PATCH_EMBED_STAGE2 = os.environ.get('FREEZE_PATCH_EMBED_STAGE2', '1').lower() not in ['0', 'false']
+FREEZE_BLOCKS_BEFORE_STAGE2 = int(os.environ.get('FREEZE_BLOCKS_BEFORE_STAGE2', 12))
+FREEZE_EPOCHS_STAGE2 = int(os.environ.get('FREEZE_EPOCHS_STAGE2', 2))
+
+# EMA
+USE_EMA = os.environ.get('USE_EMA', '1').lower() not in ['0', 'false']
+EMA_DECAY = float(os.environ.get('EMA_DECAY', 0.9999))
+
 # === 动态参数配置 (根据阶段自动调整) ===
 if CURRENT_STAGE == 1:
 	# Stage 1: 384 分辨率
@@ -105,17 +123,19 @@ if CURRENT_STAGE == 1:
 	# 显存配置 (384px)
 	# 单卡 4090 24G 通常可以稳定跑到 BS=8
 	BATCH_SIZE = 8
-	ACCUM_STEPS = 8		# 等效 BS = 8 * 8 = 64
+	ACCUM_STEPS = 8        # 等效 BS = 8 * 8 = 64
+	WEIGHT_DECAY = 0.05
 elif CURRENT_STAGE == 2:
 	# Stage 2: 512 分辨率 (显存压力显著增加)
 	IMAGE_SIZE = 512
 	EPOCHS = 10
-	# 按你的 Checklist：Stage2 学习率约为 Stage1 的 1/10，防止破坏已学到的表征
-	BASE_LR = 1e-6
+	# 使用专门为 Stage2 设计的 solver（LLRD + 更高 base lr）
+	BASE_LR = STAGE2_BASE_LR
 
 	# 显存配置 (512px) - 建议调小 batch 防止 OOM
 	BATCH_SIZE = 4
-	ACCUM_STEPS = 16	# 等效 BS = 4 * 16 = 64
+	ACCUM_STEPS = 16    # 等效 BS = 4 * 16 = 64
+	WEIGHT_DECAY = STAGE2_WEIGHT_DECAY
 else:
 	raise ValueError(f"CURRENT_STAGE 只能是 1 或 2，但得到 {CURRENT_STAGE}")
 IMG_MEAN = [0.5, 0.5, 0.5]
@@ -135,7 +155,6 @@ K_FOLDS = 5
 # Stage1/Stage2 的 BASE_LR 已在上方按 CURRENT_STAGE 指定。
 # 如果你后续仍想保留 warmup/cosine 等策略，可以在 train_vit.py 使用 WARMUP_EPOCHS。
 WARMUP_EPOCHS = 0
-WEIGHT_DECAY = 0.05
 CLIP_GRAD_NORM = 1.0
 
 # ===== Stage 2 初始化：从 Stage 1 权重 warm-start =====

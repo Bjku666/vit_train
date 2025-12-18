@@ -32,6 +32,21 @@ def parse_args():
                         help="Path to model files. Use quotes for wildcards, e.g., 'models/run_xxx/vit_fold*.pth'")
     return parser.parse_args()
 
+def tta_shift(images: torch.Tensor, shift_px: int):
+    # 使用 padding + slice，避免环绕效应
+    pad = torch.nn.functional.pad(images, (0, 0, 0, 0, shift_px, shift_px, shift_px, shift_px))
+    views = []
+    # up
+    views.append(pad[:, :, shift_px*2:, shift_px:-shift_px])
+    # down
+    views.append(pad[:, :, :-shift_px*2, shift_px:-shift_px])
+    # left
+    views.append(pad[:, :, shift_px:-shift_px, shift_px*2:])
+    # right
+    views.append(pad[:, :, shift_px:-shift_px, :-shift_px*2])
+    return views
+
+
 def main():
     args = parse_args()
     
@@ -85,6 +100,9 @@ def main():
     all_probs, all_labels = [], []
     
     print("\nRunning Inference with 2x TTA (Identity + HFlip, No Rotation)...")
+    shift_tta = int(os.environ.get('SHIFT_TTA', '0')) == 1
+    shift_px = int(os.environ.get('SHIFT_PX', '8'))
+
     with torch.no_grad():
         for images, labels in tqdm(loader):
             images = images.to(config.DEVICE)
@@ -92,6 +110,9 @@ def main():
 
             prob_sum = torch.zeros(images.size(0), device=config.DEVICE)
             tta_views = [images, torch.flip(images, dims=[3])]
+            if shift_tta:
+                tta_views.extend(tta_shift(images, shift_px))
+                tta_views.extend([torch.flip(v, dims=[3]) for v in tta_views if v is not images])
             denom = float(len(models) * len(tta_views))
             
             for model in models:

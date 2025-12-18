@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
+from timm.utils import ModelEmaV2
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -34,6 +35,94 @@ os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import config
 from model import get_model
 from dataset import MedicalDataset
+
+
+def get_optimizer_param_groups(model: nn.Module, base_lr: float, weight_decay: float, layer_decay: float) -> list[dict]:
+    """构建 LLRD 参数组。
+
+    规则：
+    - ViT backbone blocks 分层衰减：block i 的 lr = base_lr * layer_decay ** (num_layers-1-i)
+    - patch_embed / pos_embed 使用最小 lr（最深层）
+    - head 使用最大 lr（不衰减）
+    - no_decay：Norm、bias 不做 weight decay
+    - 兼容 DataParallel
+    """
+
+    def _is_no_decay(n: str, p: nn.Parameter) -> bool:
+        if not p.requires_grad:
+            return True
+        if n.endswith('.bias'):
+            return True
+        if 'norm' in n.lower() or 'bn' in n.lower():
+            return True
+        return False
+
+    model_ref = model.module if isinstance(model, nn.DataParallel) else model
+    backbone = getattr(model_ref, 'backbone', None)
+    head = getattr(model_ref, 'head', None)
+    if backbone is None or head is None:
+        raise RuntimeError('模型缺少 backbone 或 head，无法应用 LLRD')
+
+    # backbone blocks
+    blocks = getattr(backbone, 'blocks', None)
+    if blocks is None:
+        raise RuntimeError('backbone.blocks 不存在，无法应用 LLRD')
+    num_layers = len(blocks)
+
+    # 收集参数
+    param_groups = []
+
+    # patch_embed / pos_embed -> 最小 lr
+    min_lr = base_lr * (layer_decay ** (num_layers - 1)) if num_layers > 0 else base_lr
+    for name, module in [('patch_embed', getattr(backbone, 'patch_embed', None)), ('pos_embed', getattr(backbone, 'pos_embed', None))]:
+        if module is None:
+            continue
+        for n, p in (module.named_parameters() if hasattr(module, 'named_parameters') else [(name, module)]):
+            if not p.requires_grad:
+                continue
+            group = {
+                'params': [p],
+                'lr': min_lr,
+                'weight_decay': 0.0 if _is_no_decay(n, p) else weight_decay,
+            }
+            param_groups.append(group)
+
+    # blocks 分层衰减
+    for i, block in enumerate(blocks):
+        layer_lr = base_lr * (layer_decay ** (num_layers - 1 - i))
+        for n, p in block.named_parameters():
+            if not p.requires_grad:
+                continue
+            group = {
+                'params': [p],
+                'lr': layer_lr,
+                'weight_decay': 0.0 if _is_no_decay(n, p) else weight_decay,
+            }
+            param_groups.append(group)
+
+    # backbone.norm (若存在) 使用最小 lr
+    if hasattr(backbone, 'norm'):
+        for n, p in backbone.norm.named_parameters():
+            if not p.requires_grad:
+                continue
+            param_groups.append({
+                'params': [p],
+                'lr': min_lr,
+                'weight_decay': 0.0 if _is_no_decay(n, p) else weight_decay,
+            })
+
+    # head 不衰减，使用 base_lr（最大 lr）
+    max_lr = base_lr
+    for n, p in head.named_parameters():
+        if not p.requires_grad:
+            continue
+        param_groups.append({
+            'params': [p],
+            'lr': max_lr,
+            'weight_decay': 0.0 if _is_no_decay(n, p) else weight_decay,
+        })
+
+    return param_groups
 
 
 def _apply_mixup(images: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -289,8 +378,50 @@ def main():
         if gpu_count > 1:
             model = nn.DataParallel(model)
 
-        optimizer = optim.AdamW(model.parameters(), lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
+        # ===== 冻结→解冻策略 (Stage2) =====
+        frozen_modules = []
+        if config.CURRENT_STAGE == 2:
+            m_ref = model.module if isinstance(model, nn.DataParallel) else model
+            backbone = getattr(m_ref, 'backbone', None)
+            if backbone is None:
+                raise RuntimeError('缺少 backbone，无法冻结')
+
+            if config.FREEZE_PATCH_EMBED_STAGE2:
+                for p in getattr(backbone, 'patch_embed', []).parameters():
+                    p.requires_grad = False
+                if hasattr(backbone, 'pos_embed') and isinstance(backbone.pos_embed, torch.nn.Parameter):
+                    backbone.pos_embed.requires_grad = False
+                frozen_modules.append('patch_embed+pos_embed')
+
+            blocks = getattr(backbone, 'blocks', [])
+            num_freeze = min(config.FREEZE_BLOCKS_BEFORE_STAGE2, len(blocks))
+            for idx in range(num_freeze):
+                for p in blocks[idx].parameters():
+                    p.requires_grad = False
+            if num_freeze > 0:
+                frozen_modules.append(f'blocks[0:{num_freeze}]')
+
+            if frozen_modules:
+                logger.info(f"[Stage2] 冻结模块: {', '.join(frozen_modules)} | 解冻将在 epoch={config.FREEZE_EPOCHS_STAGE2}")
+
+        # ===== LLRD 参数组 =====
+        if config.USE_LLRD and config.CURRENT_STAGE == 2:
+            param_groups = get_optimizer_param_groups(model, base_lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY, layer_decay=config.LAYER_DECAY)
+            optimizer = optim.AdamW(param_groups, weight_decay=config.WEIGHT_DECAY)
+            lr_list = [g['lr'] for g in param_groups]
+            logger.info(f"[LLRD] min_lr={min(lr_list):.2e} max_lr={max(lr_list):.2e} groups={len(param_groups)}")
+        else:
+            optimizer = optim.AdamW(model.parameters(), lr=config.BASE_LR, weight_decay=config.WEIGHT_DECAY)
+            logger.info(f"[Optimizer] AdamW 单组 | lr={config.BASE_LR:.2e}")
+
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=config.BASE_LR * 0.1)
+
+        # ===== EMA =====
+        ema = None
+        if getattr(config, 'USE_EMA', False):
+            m_for_ema = model.module if isinstance(model, nn.DataParallel) else model
+            ema = ModelEmaV2(m_for_ema, decay=getattr(config, 'EMA_DECAY', 0.9999), device=config.DEVICE)
+            logger.info(f"[EMA] 启用 EMA | decay={getattr(config, 'EMA_DECAY', 0.9999)}")
         
         best_acc = 0.0
         # Stage1/Stage2 命名策略：
@@ -308,6 +439,22 @@ def main():
         oof_stage_save_path = os.path.join(config.OOF_DIR, f'oof_stage{config.CURRENT_STAGE}_fold_{fold_idx}.csv')
 
         for epoch in range(config.EPOCHS):
+            # 解冻触发
+            if config.CURRENT_STAGE == 2 and frozen_modules and epoch == config.FREEZE_EPOCHS_STAGE2:
+                m_ref = model.module if isinstance(model, nn.DataParallel) else model
+                backbone = m_ref.backbone
+                if config.FREEZE_PATCH_EMBED_STAGE2:
+                    for p in getattr(backbone, 'patch_embed', []).parameters():
+                        p.requires_grad = True
+                    if hasattr(backbone, 'pos_embed') and isinstance(backbone.pos_embed, torch.nn.Parameter):
+                        backbone.pos_embed.requires_grad = True
+                blocks = getattr(backbone, 'blocks', [])
+                num_freeze = min(config.FREEZE_BLOCKS_BEFORE_STAGE2, len(blocks))
+                for idx in range(num_freeze):
+                    for p in blocks[idx].parameters():
+                        p.requires_grad = True
+                logger.info(f"[Stage2] Epoch {epoch} 解冻完成: {', '.join(frozen_modules)}")
+
             model.train()
             train_loss_accum = 0.0
             
@@ -337,6 +484,8 @@ def main():
                 if (step + 1) % config.ACCUM_STEPS == 0:
                     nn.utils.clip_grad_norm_(model.parameters(), config.CLIP_GRAD_NORM)
                     optimizer.step()
+                    if ema is not None:
+                        ema.update(model if not isinstance(model, nn.DataParallel) else model.module)
                     optimizer.zero_grad()
 
                 train_loss_accum += loss_val
@@ -357,11 +506,12 @@ def main():
             oof_targets = []
 
             with torch.no_grad():
+                eval_model = ema.module if ema is not None else model
                 for images, labels in val_loader:
                     images = images.to(config.DEVICE)
                     labels_f = labels.to(config.DEVICE).float()
 
-                    logits = model(images)  # (B,)
+                    logits = eval_model(images)  # (B,)
                     v_loss = criterion(logits, labels_f)
                     val_loss_accum += v_loss.item()
 
@@ -378,21 +528,57 @@ def main():
             avg_train_loss = train_loss_accum / max(len(train_loader), 1)
             avg_val_loss = val_loss_accum / max(len(val_loader), 1)
 
+            # ===== 阈值搜索（快速栅格） =====
+            oof_probs_np = np.asarray(oof_probs, dtype=np.float32)
+            oof_targets_np = np.asarray(oof_targets, dtype=np.int64)
+            thresholds = np.linspace(0.2, 0.8, 601, dtype=np.float32)
+            best_t_epoch = 0.5
+            best_acc_epoch = -1.0
+            for t in thresholds:
+                preds = (oof_probs_np >= t).astype(np.int64)
+                acc = float((preds == oof_targets_np).mean())
+                if acc > best_acc_epoch or (acc == best_acc_epoch and float(t) < best_t_epoch):
+                    best_acc_epoch = acc
+                    best_t_epoch = float(t)
+
+            # 混淆矩阵 @0.5 与 @bestT
+            def _confusion(probs_np: np.ndarray, targets_np: np.ndarray, thr: float):
+                preds = (probs_np >= thr).astype(np.int64)
+                tp = int(((preds == 1) & (targets_np == 1)).sum())
+                fp = int(((preds == 1) & (targets_np == 0)).sum())
+                tn = int(((preds == 0) & (targets_np == 0)).sum())
+                fn = int(((preds == 0) & (targets_np == 1)).sum())
+                acc = float((preds == targets_np).mean())
+                return tp, fp, tn, fn, acc
+
+            tp50, fp50, tn50, fn50, acc50 = _confusion(oof_probs_np, oof_targets_np, 0.5)
+            tpbt, fpbt, tnbt, fnbt, accbt = _confusion(oof_probs_np, oof_targets_np, best_t_epoch)
+
             # TensorBoard（epoch 级，用 step 对齐，曲线连续）
             epoch_end_step = step_offset + (epoch + 1) * len(train_loader) - 1
             writer.add_scalar('Loss/train_epoch', avg_train_loss, epoch_end_step)
             writer.add_scalar('Loss/val', avg_val_loss, epoch_end_step)
-            writer.add_scalar('Acc/val@0.5', avg_val_acc, epoch_end_step)
+            writer.add_scalar('Acc/val@0.5', acc50, epoch_end_step)
+            writer.add_scalar('Acc/val@bestT', accbt, epoch_end_step)
+            writer.add_scalar('BestT/val', best_t_epoch, epoch_end_step)
+            writer.add_scalar('FP/val@0.5', fp50, epoch_end_step)
+            writer.add_scalar('FN/val@0.5', fn50, epoch_end_step)
+            writer.add_scalar('FP/val@bestT', fpbt, epoch_end_step)
+            writer.add_scalar('FN/val@bestT', fnbt, epoch_end_step)
 
-            logger.info(f"Epoch {epoch+1:02d} | TrainLoss={avg_train_loss:.4f} | ValLoss={avg_val_loss:.4f} | ValAcc@0.5={avg_val_acc:.4f}")
+            logger.info(
+                f"Epoch {epoch+1:02d} | TrainLoss={avg_train_loss:.4f} | ValLoss={avg_val_loss:.4f} | "
+                f"ValAcc@0.5={acc50:.4f} | ValAcc@bestT={accbt:.4f} | bestT={best_t_epoch:.3f} | "
+                f"FP@0.5={fp50} FN@0.5={fn50} | FP@bestT={fpbt} FN@bestT={fnbt}"
+            )
 
             # 每个 epoch 后走一步 scheduler（按 epoch 维度）
             scheduler.step()
 
-            # 保存最优模型 + 对应 OOF（用于后续阈值搜索）
-            if avg_val_acc > best_acc:
-                best_acc = avg_val_acc
-                model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+            # 保存最优模型 (以本轮 bestT 的 acc 为准)
+            if accbt > best_acc:
+                best_acc = accbt
+                model_to_save = ema.module if (ema is not None) else (model.module if isinstance(model, nn.DataParallel) else model)
                 torch.save(model_to_save.state_dict(), model_save_path)
 
                 if model_alias_path is not None:
@@ -402,7 +588,7 @@ def main():
                 oof_df.to_csv(oof_save_path, index=False)
                 oof_df.to_csv(oof_stage_save_path, index=False)
 
-                logger.info(f"   >>> Best Model Saved | Acc@0.5={best_acc:.4f} | {model_save_path}")
+                logger.info(f"   >>> Best Model Saved | Acc@bestT={best_acc:.4f} | bestT={best_t_epoch:.3f} | {model_save_path}")
                 if model_alias_path is not None:
                     logger.info(f"   >>> Model Alias Updated: {model_alias_path}")
                 logger.info(f"   >>> OOF Saved: {oof_save_path} (n={len(oof_df)})")
@@ -416,7 +602,7 @@ def main():
 
         writer.close()
 
-        del model, optimizer
+        del model, optimizer, ema
         torch.cuda.empty_cache()
 
     logger.info("训练完成。")
