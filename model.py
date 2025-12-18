@@ -100,6 +100,18 @@ class TimmBinaryClassifier(nn.Module):
                     feat = feat.permute(0, 2, 3, 1).contiguous().mean(dim=(1, 2))
                 else:
                     feat = feat.mean(dim=(-2, -1))
+
+        # 若返回 token/sequence 特征 (B, N, C) 或 (B, C, N)
+        # 典型：ViT / Swin 的 forward_features 可能给 (B, L, C)
+        if isinstance(feat, torch.Tensor) and feat.dim() == 3:
+            C = self.head.in_features
+            if feat.shape[-1] == C:      # (B, N, C)
+                feat = feat.mean(dim=1)
+            elif feat.shape[1] == C:     # (B, C, N)
+                feat = feat.mean(dim=2)
+            else:
+                # 回退：直接对 token 维做平均
+                feat = feat.mean(dim=1)
         out = self.head(feat)
         return out.squeeze(-1)
 

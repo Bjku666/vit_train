@@ -1,85 +1,87 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
-# 提交脚本：仅对“无标签测试集”进行推理并写出提交 CSV。
-#
-# 用法示例：
-#   RUN_ID=run1 STAGE=2 MODEL_NAME="swin_base_patch4_window12_384" SELECT="epoch:006" ./submit.sh
-#   RUN_ID=run1 STAGE=2 AVG_LAST_K=3 ./submit.sh
-#
-# 可选参数：
-#   THRESHOLD=0.62   # 覆盖阈值（推荐基于验证集决定）
-#   NO_TTA=1         # 关闭 TTA
+echo "========================================"
+echo "        Submit (single-split)"
+echo "========================================"
 
-export CONFIG_INIT_DIRS=0
-
-RUN_ID="${RUN_ID:?请设置 RUN_ID=...}"
-STAGE="${STAGE:-2}"
-export CURRENT_STAGE="${STAGE}"
-export MODEL_NAME="${MODEL_NAME:-swin_base_patch4_window12_384}"
-
-CKPT_DIR="models/run_${RUN_ID}"
-if [ ! -d "${CKPT_DIR}" ]; then
-  echo "[错误] 未找到权重目录: ${CKPT_DIR}"
+# ---- choose run folder
+runs=( $(ls -1t models/ | grep "^run_" | head -n 8 || true) )
+if [ ${#runs[@]} -eq 0 ]; then
+  echo "No run_ folders found under models/"
   exit 1
 fi
 
-# ckpt pattern: modelname_stageX_*.pth
-PATTERN="${PATTERN:-*_stage${STAGE}_*.pth}"
+echo "Recent runs:"
+for i in "${!runs[@]}"; do
+  echo "  $((i+1))) ${runs[$i]}"
+done
 
-SELECT="${SELECT:-}"
-AVG_LAST_K="${AVG_LAST_K:-0}"
+read -p "Choose RUN [1-${#runs[@]}] (default 1): " RUN_IDX
+RUN_IDX=${RUN_IDX:-1}
+RUN_DIR="models/${runs[$((RUN_IDX-1))]}"
+RUN_ID_FROM_DIR="${runs[$((RUN_IDX-1))]#run_}"
+export RUN_ID="${RUN_ID_FROM_DIR}"
 
-# 解析阈值：
-# 1) 环境变量 THRESHOLD
-# 2) 读取 train_vit.py 写入的最新 *_meta.json 中的 best_thr
-# 3) 兜底为 0.5
-THRESHOLD_VAL=""
-META_JSON=""
-if [ -n "${THRESHOLD:-}" ]; then
-  THRESHOLD_VAL="${THRESHOLD}"
-else
-  META_JSON=$(ls -1t "${CKPT_DIR}"/*_meta.json 2>/dev/null | head -n 1 || true)
-  if [ -n "${META_JSON}" ]; then
-    THRESHOLD_VAL=$(python - "${META_JSON}" <<'PY'
-import json, sys
-p = sys.argv[1]
-try:
-    j = json.load(open(p, "r", encoding="utf-8"))
-    v = j.get("best_thr", j.get("best_threshold", j.get("threshold", 0.5)))
-    print(float(v))
-except Exception:
-    print(0.5)
-PY
-)
-  else
-    THRESHOLD_VAL="0.5"
+# ---- stage
+echo "Select STAGE for inference (must match training resolution logic):"
+echo "  1) Stage 1"
+echo "  2) Stage 2"
+read -p "STAGE [default 2]: " STAGE
+STAGE=${STAGE:-2}
+export CURRENT_STAGE="${STAGE}"
+
+# ---- GPU
+read -p "GPU_ID [default 0]: " GPU_ID
+GPU_ID=${GPU_ID:-0}
+export CUDA_VISIBLE_DEVICES="${GPU_ID}"
+
+# ---- select checkpoint
+echo "----------------------------------------"
+echo "Choose checkpoint:"
+echo "  1) use *_stage${STAGE}_best.pth"
+echo "  2) choose an epoch ckpt (*_stage${STAGE}_epochXXX.pth)"
+read -p "Option [1/2] (default 1): " OPT
+OPT=${OPT:-1}
+
+CKPT=""
+if [ "${OPT}" = "1" ]; then
+  CKPT=$(ls -1 "${RUN_DIR}/"*"_stage${STAGE}_best.pth" 2>/dev/null | head -n 1 || true)
+  if [ -z "${CKPT}" ]; then
+    echo "best checkpoint not found under ${RUN_DIR}/"
+    exit 1
   fi
+else
+  cands=( $(ls -1 "${RUN_DIR}/"*"_stage${STAGE}_epoch"*.pth 2>/dev/null | tail -n 20 || true) )
+  if [ ${#cands[@]} -eq 0 ]; then
+    echo "No epoch checkpoints found under ${RUN_DIR}/"
+    exit 1
+  fi
+  echo "Recent epoch checkpoints:"
+  for i in "${!cands[@]}"; do
+    echo "  $((i+1))) ${cands[$i]}"
+  done
+  read -p "Choose ckpt [1-${#cands[@]}] (default ${#cands[@]}): " CIDX
+  CIDX=${CIDX:-${#cands[@]}}
+  CKPT="${cands[$((CIDX-1))]}"
 fi
 
-NO_TTA_FLAG=""
-if [ "${NO_TTA:-0}" = "1" ]; then
-  NO_TTA_FLAG="--no_tta"
-fi
+echo "----------------------------------------"
+echo "RUN_DIR : ${RUN_DIR}"
+echo "STAGE   : ${STAGE}"
+echo "GPU_ID  : ${GPU_ID}"
+echo "CKPT    : ${CKPT}"
+echo "----------------------------------------"
 
-echo "========================================"
-echo "仅对无标签测试集进行推理"
-echo "  RUN_ID      : ${RUN_ID}"
-echo "  阶段(STAGE) : ${STAGE}"
-echo "  模型名称    : ${MODEL_NAME}"
-echo "  权重目录    : ${CKPT_DIR}"
-echo "  匹配模式    : ${PATTERN}"
-echo "  选择策略    : ${SELECT}"
-echo "  均值最后K   : ${AVG_LAST_K}"
-echo "  阈值        : ${THRESHOLD_VAL}"
-echo "  元数据JSON  : ${META_JSON}"
-echo "  TTA         : $([ -z "${NO_TTA_FLAG}" ] && echo 启用 || echo 关闭)"
-echo "========================================"
+CKPT_BASE=$(basename "${CKPT}" .pth)
+OUTPUT_CSV_DEFAULT="output/submission_${RUN_ID}_stage${STAGE}_${CKPT_BASE}.csv"
+OUTPUT_CSV="${OUTPUT_CSV:-$OUTPUT_CSV_DEFAULT}"
+echo "OUTPUT  : ${OUTPUT_CSV}"
+echo "----------------------------------------"
 
-python inference.py \
-  --ckpt "${CKPT_DIR}" \
-  --pattern "${PATTERN}" \
-  --select "${SELECT}" \
-  --avg_last_k "${AVG_LAST_K}" \
-  --threshold "${THRESHOLD_VAL}" \
-  ${NO_TTA_FLAG}
+# ---- run inference
+# 你当前版本应该已经没有 benchmark / pseudo 逻辑了，所以 inference.py 只负责：
+#   读取测试集 -> 推理 -> 输出 submission.csv
+python inference.py --ckpt "${CKPT}" --output_csv "${OUTPUT_CSV}"
+
+echo "Done. Check output/ for submission csv."

@@ -1,21 +1,32 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -e
 
-# --- 配置区 ---
-LOG_DIR="./logs"
-PORT=6006
-MONITOR_LOG="./monitor.log"
+echo "========================================"
+echo "              Monitor Logs"
+echo "========================================"
 
-echo " 清理旧的 TensorBoard 进程..."
-pkill -f "tensorboard"
+# list recent logs
+logs=( $(ls -1t logs/train_*_stage*.log 2>/dev/null | head -n 10 || true) )
+if [ ${#logs[@]} -eq 0 ]; then
+  echo "❌ No logs found under logs/"
+  exit 1
+fi
 
-echo " 启动 TensorBoard..."
-echo "监控目录: $LOG_DIR"
-echo "端口: $PORT"
-echo "Monitor Log: $MONITOR_LOG"
+echo "Recent logs:"
+for i in "${!logs[@]}"; do
+  echo "  $((i+1))) ${logs[$i]}"
+done
 
-# --bind_all 允许远程访问 (SSH Tunnel)
-# 日志写入项目根目录 monitor.log，便于排查问题
-nohup tensorboard --logdir=$LOG_DIR --port $PORT --bind_all > "$MONITOR_LOG" 2>&1 &
+read -p "Choose log [1-${#logs[@]}] (default 1): " IDX
+IDX=${IDX:-1}
 
-echo " TensorBoard 已在后台运行！"
-echo "请在浏览器访问: http://localhost:$PORT"
+if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt "${#logs[@]}" ]; then
+  echo "❌ Invalid selection."
+  exit 1
+fi
+
+LOG_FILE="${logs[$((IDX-1))]}"
+echo "----------------------------------------"
+echo "Tailing: ${LOG_FILE}"
+echo "----------------------------------------"
+tail -n 200 -f "${LOG_FILE}"

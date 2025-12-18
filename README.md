@@ -11,14 +11,14 @@ This repo supports **training + inference for unlabeled test submission**.
 - `data/MedImage-TestSet/*.jpg`  (unlabeled, for submission)
 
 ## 2) Train
-Stage1 (low-res):
+Stage1 (224):
 ```bash
-GPU_ID=0 RUN_ID=run_swin_01 STAGE=1 MODEL_NAME="swin_base_patch4_window12_384" ./train.sh
+GPU_ID=0 RUN_ID=run_swin_01 STAGE=1 MODEL_NAME="swin_base_patch4_window7_224" ./train.sh
 ```
 
-Stage2 (high-res fine-tune, optional):
+Stage2 (448 fine-tune):
 ```bash
-GPU_ID=0 RUN_ID=run_swin_01 STAGE=2 MODEL_NAME="swin_base_patch4_window12_384" ./train.sh
+GPU_ID=0 RUN_ID=run_swin_01 STAGE=2 MODEL_NAME="swin_base_patch4_window7_224" ./train.sh
 ```
 
 Notes:

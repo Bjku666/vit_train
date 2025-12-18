@@ -21,12 +21,14 @@ def get_transforms():
 
     train_transform = A.Compose([
         A.HorizontalFlip(p=0.5),
-        A.ShiftScaleRotate(
-            shift_limit=0.02,
-            scale_limit=0.05,
-            rotate_limit=10,
-            border_mode=cv2.BORDER_CONSTANT,
-            value=0,
+        # NOTE: Some albumentations versions warn that `value` is not valid for ShiftScaleRotate.
+        # Use Affine as a drop-in replacement.
+        A.Affine(
+            translate_percent={"x": (-0.02, 0.02), "y": (-0.02, 0.02)},
+            scale=(0.95, 1.05),
+            rotate=(-10, 10),
+            mode=cv2.BORDER_CONSTANT,
+            cval=0,
             p=0.5,
         ),
         A.RandomBrightnessContrast(brightness_limit=0.10, contrast_limit=0.10, p=0.5),

@@ -83,7 +83,21 @@ TRAIN_DIRS = [LABELED_TRAIN_DIR]
 # 主干模型：
 # - Swin（推荐基线）：swin_base_patch4_window12_384
 # - ViT（RETFound）：vit_base_patch16_384 / vit_large_patch16_384 等
-MODEL_NAME = os.environ.get("MODEL_NAME", "swin_base_patch4_window12_384")
+"""Project config.
+
+NOTE (important for Swin):
+`swin_*_window12_384` models in timm are often hard-bound to img_size=384.
+Even if you pass `img_size=...`, some internal asserts / mask logic can still
+break when you feed 448/480/512.
+
+For a stable 2-stage pipeline (stage1=224 -> stage2=448), use a window7-224
+Swin as default:
+  - stage1: 224
+  - stage2: 448
+These sizes are multiples of 224, and they keep all Swin stages aligned.
+"""
+
+MODEL_NAME = os.environ.get("MODEL_NAME", "swin_base_patch4_window7_224")
 
 # 二分类（BCEWithLogitsLoss）：输出 1 维 logit
 NUM_CLASSES = 1
@@ -115,15 +129,17 @@ NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "8"))
 
 # 渐进分辨率
 if CURRENT_STAGE == 1:
-    IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "384"))
-    EPOCHS = int(os.environ.get("EPOCHS", "10"))
+    # Stage 1 (warmup stage): train at 224.
+    IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
+    EPOCHS = int(os.environ.get("EPOCHS", "15"))
     BASE_LR = float(os.environ.get("BASE_LR", "2e-5"))
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 else:
-    # Swin window=12, patch=4 => 输入尺寸需被 48 整除；默认改为 480 以避免 assert。
-    IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "480"))
-    EPOCHS = int(os.environ.get("EPOCHS", "5"))
+    # Stage 2 (hi-res finetune):
+    # For Swin window7/patch4, 448 (=224*2) is the safest choice.
+    IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "448"))
+    EPOCHS = int(os.environ.get("EPOCHS", "12"))
     # 第二阶段短训微调
     BASE_LR = float(os.environ.get("BASE_LR", "5e-6"))
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.1"))

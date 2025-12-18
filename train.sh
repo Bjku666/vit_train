@@ -1,68 +1,91 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
-# 用法示例：
-#   GPU_ID=0 MODEL_NAME="swin_base_patch4_window12_384" STAGE=1 RUN_ID=run1 ./train.sh
-#   GPU_ID=0 MODEL_NAME="swin_base_patch4_window12_384" STAGE=2 RUN_ID=run1 INIT_CKPT="models/run_run1/..._stage1_best.pth" ./train.sh
+# ============================
+#  Interactive Train Launcher
+#  single-split, no pseudo, no local benchmark
+# ============================
 
-GPU_ID="${GPU_ID:-0}"
+echo "========================================"
+echo "           Train (single-split)"
+echo "========================================"
+
+# ---- GPU
+read -p "GPU_ID [default 0]: " GPU_ID
+GPU_ID=${GPU_ID:-0}
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
-STAGE="${STAGE:-1}"
+# ---- Stage
+echo "Select STAGE:"
+echo "  1) Stage 1 (base resolution, e.g. 384)"
+echo "  2) Stage 2 (higher resolution, Swin must be divisible by 48 if window12/patch4)"
+read -p "STAGE [default 1]: " STAGE
+STAGE=${STAGE:-1}
 export CURRENT_STAGE="${STAGE}"
 
-# 如果希望 Stage2 共享同一输出目录，请在两个阶段使用相同的 RUN_ID
-if [ -n "$RUN_ID" ]; then
-  export RUN_ID="$RUN_ID"
+# ---- RUN_ID (recommended: reuse the same RUN_ID across stage1/stage2)
+read -p "RUN_ID (empty=auto timestamp, reuse same id for stage2) [default auto]: " RUN_ID
+if [ -z "${RUN_ID}" ]; then
+  RUN_ID=$(date +"%Y%m%d_%H%M%S")
 fi
 
-# 默认使用 Swin；需要时可覆盖
-export MODEL_NAME="${MODEL_NAME:-swin_base_patch4_window12_384}"
+# ---- model name
+read -p "MODEL_NAME [default swin_base_patch4_window12_384]: " MODEL_NAME
+MODEL_NAME=${MODEL_NAME:-swin_base_patch4_window12_384}
 
-# 默认：单划分
-export USE_KFOLD="${USE_KFOLD:-0}"
+# ---- epochs (optional)
+read -p "EPOCHS (optional, empty=use config default): " EPOCHS
 
-mkdir -p logs
+# ---- extra args (optional)
+read -p "EXTRA_ARGS (optional): " EXTRA_ARGS
 
-LOG_FILE="logs/train_${RUN_ID:-auto}_stage${STAGE}.log"
+mkdir -p logs "models/run_${RUN_ID}"
 
-EXTRA_ARGS=""
+LOG_FILE="logs/train_${RUN_ID}_stage${STAGE}.log"
 
-# Stage2 预热（warm start）
-if [ "$STAGE" = "2" ]; then
-  # 若用户传入 INIT_CKPT，则直接使用
-  if [ -n "$INIT_CKPT" ]; then
-    EXTRA_ARGS="--init_ckpt ${INIT_CKPT}"
+# ---- Stage2 warm start: auto-detect stage1 best ckpt in same run
+INIT_CKPT=""
+if [ "${STAGE}" = "2" ]; then
+  CAND=$(ls -1 "models/run_${RUN_ID}/"*"_stage1_best.pth" 2>/dev/null | head -n 1 || true)
+  if [ -n "${CAND}" ]; then
+    INIT_CKPT="--init_ckpt ${CAND}"
+    echo "[Init] Found stage1 best ckpt: ${CAND}"
   else
-    # 尝试从同一 run 目录自动查找
-    if [ -n "$RUN_ID" ] && [ -d "models/run_${RUN_ID}" ]; then
-      CAND=$(ls -1 models/run_${RUN_ID}/*_stage1_*_best.pth 2>/dev/null | head -n 1 || true)
-      if [ -z "$CAND" ]; then
-        CAND=$(ls -1 models/run_${RUN_ID}/*_stage1_*_epoch*.pth 2>/dev/null | tail -n 1 || true)
-      fi
-      if [ -n "$CAND" ]; then
-        EXTRA_ARGS="--init_ckpt ${CAND}"
-        echo "[自动] 使用 init_ckpt => ${CAND}"
-      else
-        echo "[警告] 未找到 Stage1 权重用于 warm-start，将从头训练 Stage2。"
-      fi
-    fi
+    echo "[Warn] No stage1 best ckpt found under models/run_${RUN_ID}/. Stage2 will train from scratch."
   fi
 fi
 
-echo "========================================"
-echo "训练"
-echo "  GPU_ID      : ${GPU_ID}"
-echo "  阶段(STAGE) : ${STAGE}"
-echo "  RUN_ID      : ${RUN_ID:-auto}"
-echo "  模型名称    : ${MODEL_NAME}"
-echo "  使用K折     : ${USE_KFOLD}"
-echo "  额外参数    : ${EXTRA_ARGS}"
-echo "  日志文件    : ${LOG_FILE}"
-echo "========================================"
+# ---- epochs arg
+EPOCH_ARG=""
+if [ -n "${EPOCHS}" ]; then
+  EPOCH_ARG="--epochs ${EPOCHS}"
+fi
 
-nohup python -u train_vit.py ${EXTRA_ARGS} > "${LOG_FILE}" 2>&1 &
+# ---- print summary
+echo "----------------------------------------"
+echo "GPU_ID     : ${GPU_ID}"
+echo "STAGE      : ${STAGE}"
+echo "RUN_ID     : ${RUN_ID}"
+echo "MODEL_NAME : ${MODEL_NAME}"
+echo "LOG_FILE   : ${LOG_FILE}"
+echo "INIT_CKPT  : ${INIT_CKPT}"
+echo "EPOCHS     : ${EPOCHS:-<config default>}"
+echo "EXTRA_ARGS : ${EXTRA_ARGS}"
+echo "----------------------------------------"
+echo "Command:"
+echo "python train_vit.py --run_id ${RUN_ID} --stage ${STAGE} --model_name ${MODEL_NAME} ${INIT_CKPT} ${EPOCH_ARG} ${EXTRA_ARGS}"
+echo "----------------------------------------"
+
+# ---- launch (nohup + tail hint)
+nohup python train_vit.py \
+  --run_id "${RUN_ID}" \
+  --stage "${STAGE}" \
+  --model_name "${MODEL_NAME}" \
+  ${INIT_CKPT} \
+  ${EPOCH_ARG} \
+  ${EXTRA_ARGS} \
+  > "${LOG_FILE}" 2>&1 &
+
 PID=$!
-echo "已启动. PID=${PID}"
+echo "Started. PID=${PID}"
 echo "tail -f ${LOG_FILE}"
-tail -f "${LOG_FILE}"

@@ -21,6 +21,17 @@ from tqdm import tqdm
 import config
 from dataset import MedicalDataset, get_transforms
 from model import get_model
+from collections import OrderedDict
+
+
+def _filter_state_dict(model: torch.nn.Module, state: dict) -> OrderedDict:
+    """仅保留与当前模型形状一致的权重，避免尺寸不匹配报错（如 Swin 位置偏置表）。"""
+    msd = model.state_dict()
+    out = OrderedDict()
+    for k, v in state.items():
+        if k in msd and msd[k].shape == v.shape:
+            out[k] = v
+    return out
 
 
 def resolve_ckpts(ckpt_input: str, pattern: str, select: str, avg_last_k: int) -> List[str]:
@@ -60,7 +71,12 @@ def load_model_from_ckpt(ckpt_path: str) -> torch.nn.Module:
     model = get_model().to(config.DEVICE)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
-    model.load_state_dict(sd, strict=False)
+    sd = _filter_state_dict(model, sd)
+    msg = model.load_state_dict(sd, strict=False)
+    missing = getattr(msg, "missing_keys", [])
+    unexpected = getattr(msg, "unexpected_keys", [])
+    if missing or unexpected:
+        print(f"[Load] filtered state_dict: missing={len(missing)} unexpected={len(unexpected)}")
     model.eval()
     return model
 
@@ -121,7 +137,8 @@ def main():
     names, probs = predict_probs(models, dl, tta=(not args.no_tta))
     preds = (probs >= thr).astype(np.int64)
 
-    df = pd.DataFrame({"name": names, "label": preds})
+    # 竞赛要求首列为 id，这里直接使用文件名（含扩展名）。
+    df = pd.DataFrame({"id": names, "label": preds})
     out_csv = args.output_csv or os.path.join(config.OUTPUT_DIR, f"submission_{config.RUN_ID}.csv")
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     df.to_csv(out_csv, index=False)
