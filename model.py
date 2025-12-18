@@ -158,10 +158,18 @@ def get_model() -> nn.Module:
     # Swin / ConvNeXt 等（默认 ImageNet 预训练）
     # -----------------------------
     if "swin" in name:
-        # 构建去掉分类头的主干
-        backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0)
+        checkpoint_path = config.SWIN_CHECKPOINT_PATH if os.path.exists(config.SWIN_CHECKPOINT_PATH) else ""
+        use_pretrained = checkpoint_path == ""
+        # 构建去掉分类头的主干；若提供本地权重则不会尝试联网下载。
+        backbone = timm.create_model(
+            config.MODEL_NAME,
+            pretrained=use_pretrained,
+            num_classes=0,
+            checkpoint_path=checkpoint_path,
+        )
         model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
-        print(f"[Model] Swin backbone: {config.MODEL_NAME} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
+        src = "timm pretrained" if use_pretrained else f"local ckpt: {checkpoint_path}"
+        print(f"[Model] Swin backbone: {config.MODEL_NAME} | {src} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
         return model
 
     # -----------------------------

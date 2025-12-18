@@ -40,7 +40,10 @@ def get_transforms():
         ToTensorV2(),
     ])
 
-    return train_transform, val_transform
+    # 测试/推理沿用验证流程，保持归一化一致
+    test_transform = val_transform
+
+    return train_transform, val_transform, test_transform
 
 def ben_graham_preprocessing(image, target_size=config.IMAGE_SIZE):
     """
