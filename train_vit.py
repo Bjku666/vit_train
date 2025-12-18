@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import shutil
+import hashlib
 from dataclasses import asdict, dataclass
 from glob import glob
 from typing import Dict, List, Tuple
@@ -39,11 +40,13 @@ from model import get_model
 # 工具函数
 # -----------------------------
 def set_seed(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def ensure_dir(p: str) -> None:
@@ -99,6 +102,54 @@ def gather_image_paths_and_labels(root_dirs) -> Tuple[List[str], List[int]]:
     paths = [paths[i] for i in order]
     labels = [labels[i] for i in order]
     return paths, labels
+
+
+def _hash_paths(paths: List[str]) -> str:
+    h = hashlib.md5()
+    for p in paths:
+        h.update(p.encode("utf-8"))
+    return h.hexdigest()
+
+
+def load_or_create_split(all_paths: List[str], labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """加载已固定的单划分；不存在则创建并落盘。
+
+    返回 (train_idx, val_idx, created_flag)。若数据集被改动（样本数/路径哈希不一致）则报错。
+    """
+    os.makedirs(config.SPLIT_DIR, exist_ok=True)
+
+    if os.path.isfile(config.SPLIT_FILE):
+        with open(config.SPLIT_FILE, "r", encoding="utf-8") as f:
+            split = json.load(f)
+
+        saved_hash = split.get("paths_hash")
+        saved_num = split.get("num_samples")
+        current_hash = _hash_paths(all_paths)
+
+        if saved_num != len(all_paths) or saved_hash != current_hash:
+            raise ValueError(
+                f"现有划分文件与当前数据集不匹配，请确认数据未改动或删除 {config.SPLIT_FILE} 后重新生成"
+            )
+
+        train_idx = np.array(split["train_idx"], dtype=np.int64)
+        val_idx = np.array(split["val_idx"], dtype=np.int64)
+        return train_idx, val_idx, False
+
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=config.VAL_RATIO, random_state=config.SEED)
+    train_idx, val_idx = next(sss.split(np.zeros_like(labels), labels))
+
+    payload = {
+        "seed": config.SEED,
+        "val_ratio": config.VAL_RATIO,
+        "num_samples": len(all_paths),
+        "paths_hash": _hash_paths(all_paths),
+        "train_idx": train_idx.tolist(),
+        "val_idx": val_idx.tolist(),
+    }
+    with open(config.SPLIT_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    return train_idx, val_idx, True
 
 
 # -----------------------------
@@ -365,8 +416,11 @@ def run_single_split(init_ckpt: str = "") -> None:
     all_paths, all_labels = gather_image_paths_and_labels(config.TRAIN_DIRS)
     y = np.array(all_labels)
 
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=config.VAL_RATIO, random_state=config.SEED)
-    train_idx, val_idx = next(sss.split(np.zeros_like(y), y))
+    train_idx, val_idx, created = load_or_create_split(all_paths, y)
+    logger.info(
+        f"[Split] {'created' if created else 'loaded'} {config.SPLIT_FILE} "
+        f"(train={len(train_idx)} val={len(val_idx)} seed={config.SEED})"
+    )
 
     train_tf, val_tf, _ = get_transforms()
     ds_train = MedicalDataset(root_dir=config.TRAIN_DIRS, mode="train", transform=train_tf, indices=train_idx, image_paths=all_paths)

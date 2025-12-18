@@ -127,6 +127,10 @@ SEED = int(os.environ.get("SEED", "42"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "8"))
 
+# 固定单划分的落盘位置（按 seed / val_ratio 区分）
+SPLIT_DIR = os.path.join(BASE_DIR, "splits")
+SPLIT_FILE = os.path.join(SPLIT_DIR, f"single_split_seed{SEED}_val{int(VAL_RATIO*100)}.json")
+
 # 渐进分辨率
 if CURRENT_STAGE == 1:
     # Stage 1 (warmup stage): train at 224.
