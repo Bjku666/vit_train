@@ -212,6 +212,9 @@ def main():
     config.IMAGE_SIZE = auto_size
     config.DEVICE = args.device
 
+    # 评测的数据预处理应与模型分辨率一致（防止 Swin attn mask 尺寸不匹配）
+    args.img_size = auto_size
+
     ds = FolderBinaryDataset(args.data_dir, args.img_size)
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False,

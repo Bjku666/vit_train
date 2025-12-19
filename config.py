@@ -94,8 +94,8 @@ break when you feed 448/480/512.
 
 For a stable 2-stage pipeline (stage1=224 -> stage2=448), use a window7-224
 Swin as default:
-  - stage1: 224
-  - stage2: 448
+    - stage1: 224
+    - stage2: 448
 These sizes are multiples of 224, and they keep all Swin stages aligned.
 """
 
@@ -146,11 +146,11 @@ if CURRENT_STAGE == 1:
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 else:
     # Stage 2 (hi-res finetune):
-    # For Swin window7/patch4, 448 (=224*2) is the safest choice.
+    # For Swin window7/patch4, 448 keeps stage alignment.
     IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "448"))
-    EPOCHS = int(os.environ.get("EPOCHS", "10"))
+    EPOCHS = int(os.environ.get("EPOCHS", "6"))
     # 第二阶段短训微调
-    BASE_LR = float(os.environ.get("BASE_LR", "7e-6"))
+    BASE_LR = float(os.environ.get("BASE_LR", "6e-6"))
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
 
@@ -169,7 +169,7 @@ USE_LLRD = os.environ.get("USE_LLRD", "0").lower() not in ["0", "false"]
 LAYER_DECAY = float(os.environ.get("LAYER_DECAY", "0.9"))
 
 # 冻结 → 解冻（仅 Stage2 生效）
-FREEZE_EPOCHS_STAGE2 = int(os.environ.get("FREEZE_EPOCHS_STAGE2", "0"))
+FREEZE_EPOCHS_STAGE2 = int(os.environ.get("FREEZE_EPOCHS_STAGE2", "1"))
 # ViT：冻结前 N 个 blocks；Swin：按 stage.blocks 展平后的前 N 个块
 FREEZE_BLOCKS_BEFORE_STAGE2 = int(os.environ.get("FREEZE_BLOCKS_BEFORE_STAGE2", "0"))
 FREEZE_PATCH_EMBED_STAGE2 = os.environ.get("FREEZE_PATCH_EMBED_STAGE2", "0").lower() not in ["0", "false"]
