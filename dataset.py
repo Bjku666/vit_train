@@ -21,15 +21,15 @@ def get_transforms():
 
     train_transform = A.Compose([
         A.HorizontalFlip(p=0.5),
-        # NOTE: Some albumentations versions warn that `value` is not valid for ShiftScaleRotate.
-        # Use Affine as a drop-in replacement.
+        # 使用 Affine 并采用新版本参数名：border_mode/value，避免 mode/cval 警告
         A.Affine(
-            translate_percent={"x": (-0.02, 0.02), "y": (-0.02, 0.02)},
+            translate_percent={"x": (-0.03, 0.03), "y": (-0.03, 0.03)},
             scale=(0.95, 1.05),
             rotate=(-10, 10),
-            mode=cv2.BORDER_CONSTANT,
-            cval=0,
-            p=0.5,
+            shear=(-5, 5),
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+            p=0.7,
         ),
         A.RandomBrightnessContrast(brightness_limit=0.10, contrast_limit=0.10, p=0.5),
         A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=5, p=0.3),

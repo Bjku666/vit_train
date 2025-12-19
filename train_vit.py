@@ -60,10 +60,23 @@ def sigmoid_np(x: np.ndarray) -> np.ndarray:
 
 
 def search_best_threshold(probs: np.ndarray, labels: np.ndarray) -> Tuple[float, float]:
-    """返回 (最佳阈值, 对应准确率)。"""
+    """返回 (最佳阈值, 对应准确率)。
+
+    使用精确搜索：以所有预测概率的唯一值相邻中点作为候选，再补 0/1，覆盖 0~1 全范围。
+    这样能找到全局最优的 acc；并对输入形状进行展平以避免广播问题。
+    """
+    probs = probs.reshape(-1)
+    labels = labels.reshape(-1).astype(np.int64)
+
+    uniq = np.unique(probs)
+    if len(uniq) == 1:
+        thr = float(uniq[0])
+        pred = (probs >= thr).astype(np.int64)
+        return thr, float((pred == labels).mean())
+
+    cand = np.concatenate(([0.0], (uniq[:-1] + uniq[1:]) / 2.0, [1.0]))
     best_thr, best_acc = 0.5, -1.0
-    # 由粗到细的栅格搜索
-    for thr in np.linspace(0.2, 0.8, 121):
+    for thr in cand:
         pred = (probs >= thr).astype(np.int64)
         acc = (pred == labels).mean()
         if acc > best_acc:
@@ -72,6 +85,8 @@ def search_best_threshold(probs: np.ndarray, labels: np.ndarray) -> Tuple[float,
 
 
 def confusion_from_probs(probs: np.ndarray, labels: np.ndarray, thr: float) -> Tuple[int, int, int, int]:
+    probs = probs.reshape(-1)
+    labels = labels.reshape(-1).astype(np.int64)
     pred = (probs >= thr).astype(np.int64)
     tn = int(((pred == 0) & (labels == 0)).sum())
     fp = int(((pred == 1) & (labels == 0)).sum())
