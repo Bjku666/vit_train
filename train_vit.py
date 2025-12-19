@@ -12,6 +12,7 @@
 
 import argparse
 import json
+import math
 import logging
 import os
 import random
@@ -25,6 +26,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 from torch.utils.data import DataLoader
@@ -76,6 +78,74 @@ def confusion_from_probs(probs: np.ndarray, labels: np.ndarray, thr: float) -> T
     fn = int(((pred == 0) & (labels == 1)).sum())
     tp = int(((pred == 1) & (labels == 1)).sum())
     return tn, fp, fn, tp
+
+
+def _resize_pos_embed_in_state_dict(sd: Dict[str, torch.Tensor], model: nn.Module) -> Dict[str, torch.Tensor]:
+    """当 warm-start 分辨率变更时，对 ViT 的 `pos_embed` 进行双三次插值以匹配当前模型。
+
+    - 仅在检测到 `backbone.pos_embed`（或备选 `pos_embed`）且模型主干存在 `pos_embed` 时生效。
+    - 对 Swin 等相对位置编码模型将自动跳过。
+    """
+    m = model.module if isinstance(model, nn.DataParallel) else model
+    if not hasattr(m, "backbone"):
+        return sd
+    backbone = m.backbone
+
+    if not hasattr(backbone, "pos_embed"):
+        return sd  # 非 ViT（如 Swin），跳过
+
+    key = None
+    if "backbone.pos_embed" in sd:
+        key = "backbone.pos_embed"
+    elif "pos_embed" in sd:
+        key = "pos_embed"
+    else:
+        return sd
+
+    pos_embed_ckpt = sd[key]
+    pos_embed_model = backbone.pos_embed
+
+    if not isinstance(pos_embed_ckpt, torch.Tensor) or not isinstance(pos_embed_model, torch.Tensor):
+        return sd
+
+    if pos_embed_ckpt.shape == pos_embed_model.shape:
+        return sd  # 尺寸一致，无需处理
+
+    try:
+        num_patches = getattr(backbone.patch_embed, "num_patches", None)
+    except Exception:
+        num_patches = None
+
+    if num_patches is None:
+        # 兜底：按 1 个 cls_token 估计（常见情形）
+        num_extra_tokens = 1
+        new_grid = int(math.sqrt(max(1, pos_embed_model.shape[1] - num_extra_tokens)))
+    else:
+        num_extra_tokens = pos_embed_model.shape[1] - int(num_patches)
+        new_grid = int(math.sqrt(int(num_patches)))
+
+    embedding_size = int(pos_embed_ckpt.shape[-1])
+
+    # 拆分额外 token 与 patch tokens
+    if pos_embed_ckpt.shape[1] <= num_extra_tokens:
+        return sd
+    extra_tokens = pos_embed_ckpt[:, :num_extra_tokens]
+    pos_tokens = pos_embed_ckpt[:, num_extra_tokens:]
+
+    old_tokens = pos_tokens.shape[1]
+    old_grid = int(math.sqrt(old_tokens))
+    if old_grid * old_grid != old_tokens or new_grid <= 0:
+        return sd  # 无法推断网格，跳过
+
+    # [1, H*W, C] -> [1, C, H, W]
+    pos_tokens = pos_tokens.reshape(1, old_grid, old_grid, embedding_size).permute(0, 3, 1, 2)
+    pos_tokens = F.interpolate(pos_tokens, size=(new_grid, new_grid), mode="bicubic", align_corners=False)
+    # [1, C, H, W] -> [1, H*W, C]
+    pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(1, new_grid * new_grid, embedding_size)
+
+    new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+    sd[key] = new_pos_embed
+    return sd
 
 
 def gather_image_paths_and_labels(root_dirs) -> Tuple[List[str], List[int]]:
@@ -434,13 +504,18 @@ def run_single_split(init_ckpt: str = "") -> None:
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
-    # 可选 warm-start
+    # 可选 warm-start（注意 ViT 分辨率变更时对 pos_embed 插值）
     if init_ckpt:
         logger.info(f"[Init] Loading init checkpoint: {init_ckpt}")
         ckpt = torch.load(init_ckpt, map_location="cpu")
         sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
+        sd = _resize_pos_embed_in_state_dict(sd, model)
         msg = (model.module if isinstance(model, nn.DataParallel) else model).load_state_dict(sd, strict=False)
-        logger.info(f"[Init] missing={len(getattr(msg,'missing_keys',[]))} unexpected={len(getattr(msg,'unexpected_keys',[]))}")
+        missing = getattr(msg, "missing_keys", [])
+        unexpected = getattr(msg, "unexpected_keys", [])
+        logger.info(f"[Init] missing={len(missing)} unexpected={len(unexpected)}")
+        if any("pos_embed" in k for k in missing):
+            logger.warning("[Init] 警告：pos_embed 未加载（形状不匹配且未成功插值）。请检查分辨率与插值逻辑。")
 
     # Stage2 冻结
     if config.CURRENT_STAGE == 2 and config.FREEZE_EPOCHS_STAGE2 > 0:
@@ -570,15 +645,19 @@ def run_kfold(stage1_models_dir: str = "") -> None:
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
 
-        # stage2 warm-start：加载对应 fold 的 stage1 最优
+        # stage2 warm-start：加载对应 fold 的 stage1 最优（含 ViT pos_embed 插值）
         if config.CURRENT_STAGE == 2 and stage1_models_dir:
             stage1_prefix = f"{config.MODEL_NAME.replace('/','_')}_stage1"
             cand = os.path.join(stage1_models_dir, f"{stage1_prefix}_fold{fold}_best.pth")
             if os.path.exists(cand):
                 ckpt = torch.load(cand, map_location="cpu")
                 sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
-                (model.module if isinstance(model, nn.DataParallel) else model).load_state_dict(sd, strict=False)
-                logger.info(f"[Init] loaded stage1 fold ckpt: {cand}")
+                sd = _resize_pos_embed_in_state_dict(sd, model)
+                msg = (model.module if isinstance(model, nn.DataParallel) else model).load_state_dict(sd, strict=False)
+                missing = getattr(msg, "missing_keys", [])
+                logger.info(f"[Init] loaded stage1 fold ckpt: {cand} | missing={len(missing)}")
+                if any("pos_embed" in k for k in missing):
+                    logger.warning("[Init] 警告：fold warm-start 时 pos_embed 未加载，可能导致 Stage2 遗忘。")
 
         criterion = nn.BCEWithLogitsLoss()
         if config.USE_LLRD:

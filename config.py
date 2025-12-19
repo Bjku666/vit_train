@@ -147,8 +147,8 @@ else:
     IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "448"))
     EPOCHS = int(os.environ.get("EPOCHS", "15"))
     # 第二阶段短训微调
-    BASE_LR = float(os.environ.get("BASE_LR", "1e-5"))
-    WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
+    BASE_LR = float(os.environ.get("BASE_LR", "2e-5"))
+    WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.1"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 
 ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "1"))
