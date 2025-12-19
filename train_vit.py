@@ -572,7 +572,8 @@ def run_kfold(stage1_models_dir: str = "") -> None:
 
         # stage2 warm-start：加载对应 fold 的 stage1 最优
         if config.CURRENT_STAGE == 2 and stage1_models_dir:
-            cand = os.path.join(stage1_models_dir, f"{prefix}_fold{fold}_best.pth")
+            stage1_prefix = f"{config.MODEL_NAME.replace('/','_')}_stage1"
+            cand = os.path.join(stage1_models_dir, f"{stage1_prefix}_fold{fold}_best.pth")
             if os.path.exists(cand):
                 ckpt = torch.load(cand, map_location="cpu")
                 sd = ckpt.get("state_dict", ckpt.get("model", ckpt))

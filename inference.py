@@ -110,6 +110,8 @@ def predict_probs(models: List[torch.nn.Module], loader: DataLoader, tta: bool =
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, default="", help="权重路径/目录/通配（默认：当前运行目录）")
+    parser.add_argument("--ckpts", type=str, nargs="+", default=None,
+                        help="显式指定多个 ckpt 路径（用于集成）。提供该参数时将忽略 --ckpt/--pattern/--select")
     parser.add_argument("--pattern", type=str, default="*_stage2_*.pth", help="在目录内匹配的通配模式")
     parser.add_argument("--select", type=str, default="best", help="best | last | epoch:NNN")
     parser.add_argument("--avg_last_k", type=int, default=0, help="对最后 K 个 epoch 权重做均值")
@@ -119,8 +121,11 @@ def main():
     parser.add_argument("--output_csv", type=str, default="", help="输出 CSV 路径")
     args = parser.parse_args()
 
-    ckpt_input = args.ckpt or config.CURRENT_RUN_MODELS_DIR
-    ckpts = resolve_ckpts(ckpt_input, args.pattern, args.select, args.avg_last_k)
+    if args.ckpts is not None and len(args.ckpts) > 0:
+        ckpts = [p for p in args.ckpts]
+    else:
+        ckpt_input = args.ckpt or config.CURRENT_RUN_MODELS_DIR
+        ckpts = resolve_ckpts(ckpt_input, args.pattern, args.select, args.avg_last_k)
 
     # 依次尝试：CLI 阈值 > meta.json 的 best_thr > 兜底 0.5
     meta = {}
@@ -169,7 +174,20 @@ def main():
 
     # 竞赛要求首列为 id，这里直接使用文件名（含扩展名）。
     df = pd.DataFrame({"id": names, "label": preds})
-    out_csv = args.output_csv or os.path.join(config.OUTPUT_DIR, f"submission_{config.RUN_ID}.csv")
+    # Default output name includes run/stage/model for traceability & reproducibility.
+    if args.output_csv:
+        out_csv = args.output_csv
+    else:
+        stage_tag = os.environ.get("CURRENT_STAGE", "")
+        model_tag = os.environ.get("MODEL_NAME", "model")
+        if len(ckpts) == 1:
+            ckpt_tag = os.path.splitext(os.path.basename(ckpts[0]))[0]
+        else:
+            ckpt_tag = f"ens{len(ckpts)}"
+        out_csv = os.path.join(
+            config.OUTPUT_DIR,
+            f"submission_{config.RUN_ID}_stage{stage_tag}_{model_tag}_{ckpt_tag}.csv",
+        )
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     df.to_csv(out_csv, index=False)
     print(f"已保存: {out_csv}")

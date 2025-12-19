@@ -2,31 +2,33 @@
 set -e
 
 echo "========================================"
-echo "              Monitor Logs"
+#!/usr/bin/env bash
+set -e
+
+echo "========================================"
+echo "        启动 TensorBoard（交互式）"
 echo "========================================"
 
-# list recent logs
-logs=( $(ls -1t logs/train_*_stage*.log 2>/dev/null | head -n 10 || true) )
-if [ ${#logs[@]} -eq 0 ]; then
-  echo "❌ No logs found under logs/"
-  exit 1
+read -p "日志目录 [./logs]: " LOG_DIR
+LOG_DIR=${LOG_DIR:-./logs}
+
+read -p "端口 [6006]: " PORT
+PORT=${PORT:-6006}
+
+read -p "是否结束已存在的 tensorboard 进程? [Y/n]: " KILL
+KILL=${KILL:-Y}
+if [[ "$KILL" =~ ^[Yy]$ ]]; then
+  pkill -f tensorboard || true
 fi
 
-echo "Recent logs:"
-for i in "${!logs[@]}"; do
-  echo "  $((i+1))) ${logs[$i]}"
-done
-
-read -p "Choose log [1-${#logs[@]}] (default 1): " IDX
-IDX=${IDX:-1}
-
-if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt "${#logs[@]}" ]; then
-  echo "❌ Invalid selection."
-  exit 1
-fi
-
-LOG_FILE="${logs[$((IDX-1))]}"
+MONITOR_LOG="monitor_tb.log"
 echo "----------------------------------------"
-echo "Tailing: ${LOG_FILE}"
+echo "logdir : ${LOG_DIR}"
+echo "port   : ${PORT}"
+echo "log    : ${MONITOR_LOG}"
 echo "----------------------------------------"
-tail -n 200 -f "${LOG_FILE}"
+
+nohup tensorboard --logdir "${LOG_DIR}" --port "${PORT}" --bind_all > "${MONITOR_LOG}" 2>&1 &
+PID=$!
+echo "TensorBoard 已启动，PID=${PID}"
+echo "访问地址: http://localhost:${PORT}"

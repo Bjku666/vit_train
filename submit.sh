@@ -2,101 +2,83 @@
 set -e
 
 echo "========================================"
-echo "        Submit (single-split)"
+echo "              提交脚本（交互式）"
 echo "========================================"
 
-# ---- choose run folder
-runs=( $(ls -1t models/ | grep "^run_" | head -n 8 || true) )
-if [ ${#runs[@]} -eq 0 ]; then
-  echo "No run_ folders found under models/"
+read -p "RUN_ID（例如 20251218_210000）[自动生成，无需填写直接回车]: " RUN_ID
+RUN_ID=${RUN_ID:-auto}
+
+read -p "阶段 (1=224, 2=448) [2]: " STAGE
+STAGE=${STAGE:-2}
+
+read -p "模型名（timm）[swin_base_patch4_window7_224]: " MODEL_NAME
+MODEL_NAME=${MODEL_NAME:-swin_base_patch4_window7_224}
+
+# 先提示阈值（可直接回车使用默认），避免后续再输入
+echo "----------------------------------------"
+echo "如果你已用 ./benchmark.sh 在本地带标签集上评测过，"
+echo "请将那里得到的 best_thr 填进来；否则直接回车使用默认（0.5 或 meta）。"
+read -p "最佳阈值（可留空）: " THRESHOLD
+
+# 选择一个或多个模型路径/通配符
+echo "----------------------------------------"
+echo "请输入一个或多个模型路径（支持通配符）"
+echo "示例:"
+echo "  models/run_${RUN_ID}/*_stage${STAGE}_best.pth"
+echo "  models/run_${RUN_ID}/*_stage${STAGE}_epoch*.pth"
+read -p "模型路径: " MPATH_INPUT
+
+if [ -z "$MPATH_INPUT" ]; then
+  # 默认使用本阶段的 best
+  MPATH_INPUT="models/run_${RUN_ID}/*_stage${STAGE}_best.pth"
+fi
+
+# 是否使用 TTA
+read -p "启用 TTA 水平翻转? [Y/n]: " USE_TTA
+USE_TTA=${USE_TTA:-Y}
+
+# 推断 image size
+if [ "$STAGE" = "1" ]; then
+  IMAGE_SIZE=224
+else
+  IMAGE_SIZE=448
+fi
+
+echo "=================================="
+echo "RUN_ID     : $RUN_ID"
+echo "阶段        : $STAGE (image_size=$IMAGE_SIZE)"
+echo "模型名      : $MODEL_NAME"
+echo "模型列表    : $MPATH_INPUT"
+echo "TTA         : $USE_TTA"
+echo "阈值        : ${THRESHOLD:-<默认>}"
+echo "=================================="
+
+# 展开通配符
+eval "MODEL_PATHS=( $MPATH_INPUT )"
+if [ ${#MODEL_PATHS[@]} -eq 0 ]; then
+  echo "❌ No model path resolved. Abort."
   exit 1
 fi
 
-echo "Recent runs:"
-for i in "${!runs[@]}"; do
-  echo "  $((i+1))) ${runs[$i]}"
+ARGS=(
+  --model_paths
+)
+for m in "${MODEL_PATHS[@]}"; do
+  ARGS+=("$m")
 done
 
-read -p "Choose RUN [1-${#runs[@]}] (default 1): " RUN_IDX
-RUN_IDX=${RUN_IDX:-1}
-RUN_DIR="models/${runs[$((RUN_IDX-1))]}"
-RUN_ID_FROM_DIR="${runs[$((RUN_IDX-1))]#run_}"
-export RUN_ID="${RUN_ID_FROM_DIR}"
+ARGS+=(--image_size "$IMAGE_SIZE" --stage "$STAGE")
 
-# ---- stage
-echo "Select STAGE for inference (must match training resolution logic):"
-echo "  1) Stage 1"
-echo "  2) Stage 2"
-read -p "STAGE [default 2]: " STAGE
-STAGE=${STAGE:-2}
-export CURRENT_STAGE="${STAGE}"
-
-# ---- GPU
-read -p "GPU_ID [default 0]: " GPU_ID
-GPU_ID=${GPU_ID:-0}
-export CUDA_VISIBLE_DEVICES="${GPU_ID}"
-
-echo "===================================="
-read -p "Input threshold (press Enter to use default): " USER_THR
-if [ -n "$USER_THR" ]; then
-  export THRESHOLD="$USER_THR"
-  echo "[Submit] Using user-specified threshold = $THRESHOLD"
-else
-  export THRESHOLD=""
-  echo "[Submit] Using default threshold from checkpoint"
+if [[ "$USE_TTA" =~ ^[Yy]$ ]]; then
+  ARGS+=(--tta)
 fi
 
-# ---- select checkpoint
-echo "----------------------------------------"
-echo "Choose checkpoint:"
-echo "  1) use *_stage${STAGE}_best.pth"
-echo "  2) choose an epoch ckpt (*_stage${STAGE}_epochXXX.pth)"
-read -p "Option [1/2] (default 1): " OPT
-OPT=${OPT:-1}
-
-CKPT=""
-if [ "${OPT}" = "1" ]; then
-  CKPT=$(ls -1 "${RUN_DIR}/"*"_stage${STAGE}_best.pth" 2>/dev/null | head -n 1 || true)
-  if [ -z "${CKPT}" ]; then
-    echo "best checkpoint not found under ${RUN_DIR}/"
-    exit 1
-  fi
-else
-  cands=( $(ls -1 "${RUN_DIR}/"*"_stage${STAGE}_epoch"*.pth 2>/dev/null | tail -n 20 || true) )
-  if [ ${#cands[@]} -eq 0 ]; then
-    echo "No epoch checkpoints found under ${RUN_DIR}/"
-    exit 1
-  fi
-  echo "Recent epoch checkpoints:"
-  for i in "${!cands[@]}"; do
-    echo "  $((i+1))) ${cands[$i]}"
-  done
-  read -p "Choose ckpt [1-${#cands[@]}] (default ${#cands[@]}): " CIDX
-  CIDX=${CIDX:-${#cands[@]}}
-  CKPT="${cands[$((CIDX-1))]}"
+if [ -n "$THRESHOLD" ]; then
+  ARGS+=(--threshold "$THRESHOLD")
 fi
 
-echo "----------------------------------------"
-echo "RUN_DIR : ${RUN_DIR}"
-echo "STAGE   : ${STAGE}"
-echo "GPU_ID  : ${GPU_ID}"
-echo "CKPT    : ${CKPT}"
-echo "----------------------------------------"
+# 将关键信息传递给 Python 端（inference.py 使用 config.MODEL_NAME/CURRENT_STAGE）
+export MODEL_NAME
+export CURRENT_STAGE="$STAGE"
 
-CKPT_BASE=$(basename "${CKPT}" .pth)
-OUTPUT_CSV_DEFAULT="output/submission_${RUN_ID}_stage${STAGE}_${CKPT_BASE}.csv"
-OUTPUT_CSV="${OUTPUT_CSV:-$OUTPUT_CSV_DEFAULT}"
-echo "OUTPUT  : ${OUTPUT_CSV}"
-echo "----------------------------------------"
-
-# ---- run inference
-# 你当前版本应该已经没有 benchmark / pseudo 逻辑了，所以 inference.py 只负责：
-#   读取测试集 -> 推理 -> 输出 submission.csv
-EXTRA_ARGS=(--ckpt "${CKPT}" --output_csv "${OUTPUT_CSV}")
-if [ -n "${THRESHOLD}" ]; then
-  EXTRA_ARGS+=(--threshold "${THRESHOLD}")
-fi
-
-python inference.py "${EXTRA_ARGS[@]}"
-
-echo "Done. Check output/ for submission csv."
+python submit.py "${ARGS[@]}"

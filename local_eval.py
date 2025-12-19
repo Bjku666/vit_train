@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Local evaluation on a *labeled* folder-structured dataset.
+Local evaluation on a labeled folder-structured dataset.
 
-Expected layout (your screenshot):
-  <DATA_DIR>/
-    disease/   (positive class, label=1)
-      xxx.jpg/png/...
-    normal/    (negative class, label=0)
-      yyy.jpg/png/...
-
-It loads one or multiple checkpoints and reports:
-- best threshold (by accuracy, like your training logs "val_acc@bestT")
-- accuracy / F1 / confusion matrix at best threshold
-- optional per-image probability dump
-
-NOTE: Using this set to pick models is "label peeking" for Kaggle final evaluation.
-Use it only to reduce trial-and-error due to submission limits.
+Goal: faithfully mirror the submit/inference pipeline while adding labels
+and threshold search. This file DOES NOT affect submit pipeline automatically.
 """
 import argparse
 import os
@@ -28,11 +16,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-
-try:
-    import timm
-except Exception as e:
-    raise SystemExit("timm is required. pip install timm") from e
+import config
 
 try:
     import albumentations as A
@@ -44,36 +28,35 @@ except Exception as e:
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
-def build_eval_transform(img_size: int):
-    # Keep it conservative: resize -> center crop -> normalize -> tensor
-    # You can adjust to match your submit/inference pipeline exactly.
-    return A.Compose([
-        A.LongestMaxSize(max_size=img_size),
-        A.PadIfNeeded(min_height=img_size, min_width=img_size, border_mode=0, value=0),
-        A.CenterCrop(height=img_size, width=img_size),
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ToTensorV2(),
-    ])
+from infer_utils import build_model, smart_load_state_dict, get_ckpt_meta
+from dataset import ben_graham_preprocessing
 
 
 class FolderBinaryDataset(Dataset):
+    """Labeled dataset for local eval, reusing project's preprocessing & normalization.
+
+    - Label mapping matches training: parent == 'disease' -> 1, else 0.
+    - Ben Graham preprocessing is applied, then val/submit normalization.
+    """
     def __init__(self, root: str, img_size: int):
         self.root = Path(root)
-        self.transform = build_eval_transform(img_size)
+        self.img_size = img_size
+        # Reuse project's val/test transforms for normalization only
+        # (we apply Ben Graham preprocessing beforehand for consistency).
+        from dataset import get_transforms
+        _, val_tf, _ = get_transforms()
+        self.val_tf = val_tf
         self.samples: List[Tuple[Path, int]] = []
 
-        # Positive = disease, Negative = normal (per your naming)
-        for sub, lab in [("normal", 0), ("disease", 1)]:
-            p = self.root / sub
-            if not p.exists():
-                continue
-            for fp in sorted(p.rglob("*")):
-                if fp.is_file() and fp.suffix.lower() in IMG_EXTS:
-                    self.samples.append((fp, lab))
+        for fp in sorted(self.root.rglob("*")):
+            if fp.is_file() and fp.suffix.lower() in IMG_EXTS:
+                parent = fp.parent.name.lower()
+                lab = 1 if parent == "disease" else 0
+                self.samples.append((fp, lab))
 
         if len(self.samples) == 0:
             raise ValueError(
-                f"No images found under {root}. Expected subfolders: normal/ disease/."
+                f"No images found under {root}. Expected subfolders containing images."
             )
 
     def __len__(self):
@@ -82,40 +65,17 @@ class FolderBinaryDataset(Dataset):
     def __getitem__(self, idx):
         path, y = self.samples[idx]
         img = Image.open(path).convert("RGB")
+        # Apply project Ben Graham preprocessing for consistency
+        img = ben_graham_preprocessing(img, target_size=self.img_size)
         img_np = np.array(img)
-        x = self.transform(image=img_np)["image"]  # (C,H,W) float tensor
+        x = self.val_tf(image=img_np)["image"]
         return x, torch.tensor(y, dtype=torch.float32), str(path.name)
 
 
-def load_checkpoint_state(ckpt_path: str) -> Dict:
-    obj = torch.load(ckpt_path, map_location="cpu")
-    # Common patterns:
-    # 1) {"state_dict": ..., ...}
-    # 2) {"model": ...}
-    # 3) raw state_dict
-    if isinstance(obj, dict):
-        for k in ["state_dict", "model", "model_state_dict", "net"]:
-            if k in obj and isinstance(obj[k], dict):
-                return obj[k]
-    if isinstance(obj, dict):
-        return obj
-    raise ValueError(f"Unrecognized checkpoint format: {ckpt_path}")
-
-
-def create_model(model_name: str, num_classes: int = 1, img_size: int = 224, pretrained: bool = False):
-    # For Swin models, timm uses fixed img_size unless you pass it at create_model time.
-    # We pass img_size to avoid "Input height doesn't match model" assertions.
-    kwargs = {}
-    # many timm models accept img_size; safe to pass and ignore if unsupported
-    kwargs["img_size"] = img_size
-
-    m = timm.create_model(
-        model_name,
-        pretrained=pretrained,
-        num_classes=num_classes,
-        **kwargs
-    )
-    return m
+def create_model_for_eval(ckpt_path: str) -> nn.Module:
+    m = build_model()
+    smart_load_state_dict(m, ckpt_path, strict=False)
+    return m.to(config.DEVICE).eval()
 
 
 @torch.no_grad()
@@ -192,6 +152,25 @@ def main():
     ap.add_argument("--out_csv", type=str, default="", help="Optional: save per-image probs csv for the BEST checkpoint")
     args = ap.parse_args()
 
+    # 读取首个 ckpt 的 meta，用于自动对齐评测配置，避免模型/尺寸不匹配
+    auto_model = args.model_name
+    auto_size = args.img_size
+    if args.ckpts and len(args.ckpts) > 0:
+        meta = get_ckpt_meta(args.ckpts[0])
+        m_model = meta.get("model_name")
+        m_size = meta.get("image_size")
+        if m_model and m_model != auto_model:
+            print(f"[meta] override model_name: {auto_model} -> {m_model} (from ckpt)")
+            auto_model = m_model
+        if isinstance(m_size, int) and m_size != auto_size:
+            print(f"[meta] override image_size: {auto_size} -> {m_size} (from ckpt)")
+            auto_size = int(m_size)
+
+    # 将提交使用的关键配置对齐到本地评测：模型名/输入尺寸/设备（优先使用 ckpt 元数据）
+    config.MODEL_NAME = auto_model
+    config.IMAGE_SIZE = auto_size
+    config.DEVICE = args.device
+
     ds = FolderBinaryDataset(args.data_dir, args.img_size)
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False,
@@ -202,19 +181,19 @@ def main():
     for ckpt in args.ckpts:
         ckpt = str(ckpt)
         print(f"\n=== Evaluating: {ckpt}")
-        model = create_model(args.model_name, num_classes=1, img_size=args.img_size, pretrained=False)
-        state = load_checkpoint_state(ckpt)
-
-        # allow a bit of key mismatch (heads, etc.)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"[load] missing={len(missing)} unexpected={len(unexpected)}")
-        model.to(args.device)
+        model = create_model_for_eval(ckpt)
 
         probs, labels, names = infer_probs(
             model, loader, args.device,
             tta_hflip=args.tta,
             use_amp=(not args.no_amp),
         )
+        # Print dataset distribution and mean probs per class to catch label issues
+        pos = labels == 1
+        neg = labels == 0
+        pos_mean = float(probs[pos].mean()) if pos.any() else float("nan")
+        neg_mean = float(probs[neg].mean()) if neg.any() else float("nan")
+        print(f"[data] pos={int(pos.sum())} neg={int(neg.sum())} pos_prob_mean={pos_mean:.4f} neg_prob_mean={neg_mean:.4f}")
         best = best_threshold_by_accuracy(probs, labels, steps=2001)
         f1 = f1_from_counts(best["tp"], best["fp"], best["fn"])
         print(f"[best] thr={best['thr']:.4f} acc={best['acc']:.4f} f1={f1:.4f} "
@@ -238,20 +217,21 @@ def main():
     for r in results:
         print(f"{r['acc']:.4f} | f1={r['f1']:.4f} | thr={r['best_thr']:.4f} | {Path(r['ckpt']).name}")
 
-    if args.out_json:
-        Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.out_json, "w", encoding="utf-8") as f:
+    # Default JSON output if single ckpt and not provided
+    out_json = args.out_json
+    if not out_json and len(args.ckpts) == 1:
+        out_json = str(Path(config.OUTPUT_DIR) / f"local_eval_{Path(args.ckpts[0]).stem}.json")
+    if out_json:
+        Path(out_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(out_json, "w", encoding="utf-8") as f:
             import json
             json.dump({"results": results}, f, indent=2, ensure_ascii=False)
-        print(f"\nSaved: {args.out_json}")
+        print(f"\nSaved: {out_json}")
 
     # Optionally dump per-image probabilities for the BEST ckpt (top-1)
     if args.out_csv and len(results) > 0:
         best_ckpt = results[0]["ckpt"]
-        model = create_model(args.model_name, num_classes=1, img_size=args.img_size, pretrained=False)
-        state = load_checkpoint_state(best_ckpt)
-        model.load_state_dict(state, strict=False)
-        model.to(args.device)
+        model = create_model_for_eval(best_ckpt)
         probs, labels, names = infer_probs(model, loader, args.device, tta_hflip=args.tta, use_amp=(not args.no_amp))
         thr = results[0]["best_thr"]
         pred = (probs >= thr).astype(np.int32)
