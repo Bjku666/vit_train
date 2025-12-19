@@ -202,6 +202,7 @@ def load_retfound_weights(vit_backbone: nn.Module, weight_path: str) -> Tuple[in
 
 def get_model() -> nn.Module:
     name = config.MODEL_NAME.lower()
+    dp_rate = getattr(config, "DROP_PATH_RATE", 0.1)
 
     # -----------------------------
     # Swin / ConvNeXt 等（默认 ImageNet 预训练）
@@ -217,6 +218,7 @@ def get_model() -> nn.Module:
             num_classes=0,
             global_pool="",
             img_size=config.IMAGE_SIZE,  # 确保 patch_embed/grid_size 与当前阶段分辨率一致
+            drop_path_rate=dp_rate,
         )
 
         # 允许可变输入尺寸（Stage2 可能使用 448/512）
@@ -249,7 +251,7 @@ def get_model() -> nn.Module:
     # -----------------------------
     if "vit" in name:
         # 创建不带分类头的 timm ViT 主干
-        backbone = timm.create_model(config.MODEL_NAME, pretrained=False, num_classes=0, global_pool="")
+        backbone = timm.create_model(config.MODEL_NAME, pretrained=False, num_classes=0, global_pool="", drop_path_rate=dp_rate)
 
         # 允许可变输入尺寸（Stage2 可能使用 448/512）
         try:
@@ -278,7 +280,7 @@ def get_model() -> nn.Module:
         return model
 
     # 回退：任意 timm 模型
-    backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0, global_pool="")
+    backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0, global_pool="", drop_path_rate=dp_rate)
 
     # 允许可变输入尺寸（Stage2 可能使用 448/512）
     try:
