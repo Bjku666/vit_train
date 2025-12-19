@@ -128,9 +128,9 @@ VAL_RATIO = float(os.environ.get("VAL_RATIO", "0.2"))
 # =============================
 # 训练基础参数
 # =============================
-SEED = int(os.environ.get("SEED", "42"))
+SEED = int(os.environ.get("SEED", "2025"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "8"))
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "16"))
 
 # 固定单划分的落盘位置（按 seed / val_ratio 区分）
 SPLIT_DIR = os.path.join(BASE_DIR, "splits")
@@ -140,8 +140,8 @@ SPLIT_FILE = os.path.join(SPLIT_DIR, f"single_split_seed{SEED}_val{int(VAL_RATIO
 if CURRENT_STAGE == 1:
     # Stage 1 (warmup stage): train at 224.
     IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
-    EPOCHS = int(os.environ.get("EPOCHS", "30"))
-    BASE_LR = float(os.environ.get("BASE_LR", "1e-4"))
+    EPOCHS = int(os.environ.get("EPOCHS", "25"))
+    BASE_LR = float(os.environ.get("BASE_LR", "8e-5"))
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 else:
@@ -150,7 +150,7 @@ else:
     IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "448"))
     EPOCHS = int(os.environ.get("EPOCHS", "10"))
     # 第二阶段短训微调
-    BASE_LR = float(os.environ.get("BASE_LR", "1.5e-5"))
+    BASE_LR = float(os.environ.get("BASE_LR", "7e-6"))
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
 
