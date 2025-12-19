@@ -115,6 +115,47 @@ def infer_probs(
     return probs, labels, all_names
 
 
+@torch.no_grad()
+def infer_probs_ensemble(
+    models: List[nn.Module],
+    loader: DataLoader,
+    device: str,
+    tta_hflip: bool = True,
+    use_amp: bool = True,
+):
+    for m in models:
+        m.eval()
+    all_probs = []
+    all_labels = []
+    all_names = []
+    scaler = torch.cuda.amp.autocast if (use_amp and "cuda" in device) else torch.cpu.amp.autocast
+
+    for x, y, name in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        with scaler():
+            views = [x]
+            if tta_hflip:
+                views.append(torch.flip(x, dims=[3]))
+
+            prob_sum = torch.zeros(x.size(0), device=device, dtype=torch.float32)
+            denom = float(len(models) * len(views))
+            for v in views:
+                for m in models:
+                    logits = m(v).view(-1)
+                    prob_sum += torch.sigmoid(logits)
+            prob = prob_sum / max(1.0, denom)
+
+        all_probs.append(prob.detach().float().cpu().numpy())
+        all_labels.append(y.detach().float().cpu().numpy())
+        all_names.extend(list(name))
+
+    probs = np.concatenate(all_probs, axis=0)
+    labels = np.concatenate(all_labels, axis=0)
+    return probs, labels, all_names
+
+
 def best_threshold_by_accuracy(probs: np.ndarray, labels: np.ndarray, steps: int = 2001):
     # steps=2001 -> resolution 0.0005
     ts = np.linspace(0.0, 1.0, steps)
@@ -178,6 +219,7 @@ def main():
     )
 
     results = []
+    # 单模型逐个评测
     for ckpt in args.ckpts:
         ckpt = str(ckpt)
         print(f"\n=== Evaluating: {ckpt}")
@@ -188,7 +230,6 @@ def main():
             tta_hflip=args.tta,
             use_amp=(not args.no_amp),
         )
-        # Print dataset distribution and mean probs per class to catch label issues
         pos = labels == 1
         neg = labels == 0
         pos_mean = float(probs[pos].mean()) if pos.any() else float("nan")
@@ -201,6 +242,35 @@ def main():
 
         results.append({
             "ckpt": ckpt,
+            "model_name": args.model_name,
+            "img_size": args.img_size,
+            "tta": bool(args.tta),
+            "best_thr": best["thr"],
+            "acc": best["acc"],
+            "f1": f1,
+            "tn": best["tn"], "fp": best["fp"], "fn": best["fn"], "tp": best["tp"],
+            "n": int(labels.shape[0]),
+        })
+
+    # 多模型融合评测（若选择了多个 ckpt）
+    if len(args.ckpts) > 1:
+        print(f"\n=== Evaluating Ensemble ({len(args.ckpts)} ckpts)")
+        ens_models = [create_model_for_eval(p) for p in args.ckpts]
+        probs, labels, names = infer_probs_ensemble(
+            ens_models, loader, args.device, tta_hflip=args.tta, use_amp=(not args.no_amp)
+        )
+        pos = labels == 1
+        neg = labels == 0
+        pos_mean = float(probs[pos].mean()) if pos.any() else float("nan")
+        neg_mean = float(probs[neg].mean()) if neg.any() else float("nan")
+        print(f"[data] pos={int(pos.sum())} neg={int(neg.sum())} pos_prob_mean={pos_mean:.4f} neg_prob_mean={neg_mean:.4f}")
+        best = best_threshold_by_accuracy(probs, labels, steps=2001)
+        f1 = f1_from_counts(best["tp"], best["fp"], best["fn"])
+        print(f"[best][Ensemble] thr={best['thr']:.4f} acc={best['acc']:.4f} f1={f1:.4f} "
+              f"CM=[[tn fp][fn tp]]=[[{best['tn']} {best['fp']}][{best['fn']} {best['tp']}]]")
+
+        results.append({
+            "ckpt": f"ensemble({len(args.ckpts)})",
             "model_name": args.model_name,
             "img_size": args.img_size,
             "tta": bool(args.tta),

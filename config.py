@@ -137,19 +137,19 @@ SPLIT_FILE = os.path.join(SPLIT_DIR, f"single_split_seed{SEED}_val{int(VAL_RATIO
 if CURRENT_STAGE == 1:
     # Stage 1 (warmup stage): train at 224.
     IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
-    EPOCHS = int(os.environ.get("EPOCHS", "15"))
-    BASE_LR = float(os.environ.get("BASE_LR", "2e-5"))
+    EPOCHS = int(os.environ.get("EPOCHS", "25"))
+    BASE_LR = float(os.environ.get("BASE_LR", "9e-5"))
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 else:
     # Stage 2 (hi-res finetune):
     # For Swin window7/patch4, 448 (=224*2) is the safest choice.
     IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "448"))
-    EPOCHS = int(os.environ.get("EPOCHS", "12"))
+    EPOCHS = int(os.environ.get("EPOCHS", "15"))
     # 第二阶段短训微调
-    BASE_LR = float(os.environ.get("BASE_LR", "5e-6"))
-    WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.1"))
-    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
+    BASE_LR = float(os.environ.get("BASE_LR", "1e-5"))
+    WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
+    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 
 ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "1"))
 CLIP_GRAD_NORM = float(os.environ.get("CLIP_GRAD_NORM", "1.0"))
@@ -159,13 +159,13 @@ CLIP_GRAD_NORM = float(os.environ.get("CLIP_GRAD_NORM", "1.0"))
 # LLRD / 第二阶段冻结策略
 # =============================
 USE_LLRD = os.environ.get("USE_LLRD", "1").lower() not in ["0", "false"]
-LAYER_DECAY = float(os.environ.get("LAYER_DECAY", "0.75"))
+LAYER_DECAY = float(os.environ.get("LAYER_DECAY", "0.9"))
 
 # 冻结 → 解冻（仅 Stage2 生效）
-FREEZE_EPOCHS_STAGE2 = int(os.environ.get("FREEZE_EPOCHS_STAGE2", "2"))
+FREEZE_EPOCHS_STAGE2 = int(os.environ.get("FREEZE_EPOCHS_STAGE2", "0"))
 # ViT：冻结前 N 个 blocks；Swin：按 stage.blocks 展平后的前 N 个块
-FREEZE_BLOCKS_BEFORE_STAGE2 = int(os.environ.get("FREEZE_BLOCKS_BEFORE_STAGE2", "12"))
-FREEZE_PATCH_EMBED_STAGE2 = os.environ.get("FREEZE_PATCH_EMBED_STAGE2", "1").lower() not in ["0", "false"]
+FREEZE_BLOCKS_BEFORE_STAGE2 = int(os.environ.get("FREEZE_BLOCKS_BEFORE_STAGE2", "0"))
+FREEZE_PATCH_EMBED_STAGE2 = os.environ.get("FREEZE_PATCH_EMBED_STAGE2", "0").lower() not in ["0", "false"]
 
 
 # =============================
