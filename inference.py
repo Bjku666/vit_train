@@ -22,6 +22,7 @@ import config
 from dataset import MedicalDataset, get_transforms
 from model import get_model
 from collections import OrderedDict
+from infer_utils import get_ckpt_meta
 
 
 def _filter_state_dict(model: torch.nn.Module, state: dict) -> OrderedDict:
@@ -67,8 +68,8 @@ def resolve_ckpts(ckpt_input: str, pattern: str, select: str, avg_last_k: int) -
     return ckpts
 
 
-def load_model_from_ckpt(ckpt_path: str) -> torch.nn.Module:
-    model = get_model().to(config.DEVICE)
+def load_model_from_ckpt(ckpt_path: str, model_name: str, img_size: int) -> torch.nn.Module:
+    model = get_model(model_name=model_name, img_size=img_size).to(config.DEVICE)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     sd = ckpt.get("state_dict", ckpt.get("model", ckpt))
     sd = _filter_state_dict(model, sd)
@@ -119,6 +120,9 @@ def main():
     parser.add_argument("--threshold_json", type=str, default="", help="包含 best_threshold 的 JSON 文件")
     parser.add_argument("--no_tta", action="store_true", help="关闭 TTA")
     parser.add_argument("--output_csv", type=str, default="", help="输出 CSV 路径")
+    parser.add_argument("--model_name", type=str, default=config.MODEL_NAME, help="timm 模型名（可覆盖 ckpt/meta）")
+    parser.add_argument("--img_size", type=int, default=config.IMAGE_SIZE, help="输入分辨率（可覆盖 ckpt/meta）")
+    parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"), help="运行设备")
     args = parser.parse_args()
 
     if args.ckpts is not None and len(args.ckpts) > 0:
@@ -126,6 +130,25 @@ def main():
     else:
         ckpt_input = args.ckpt or config.CURRENT_RUN_MODELS_DIR
         ckpts = resolve_ckpts(ckpt_input, args.pattern, args.select, args.avg_last_k)
+
+    # 对齐模型名/输入尺寸：CLI -> ckpt meta
+    auto_model = args.model_name
+    auto_size = args.img_size
+    if ckpts:
+        meta = get_ckpt_meta(ckpts[0])
+        m_model = meta.get("model_name")
+        m_size = meta.get("image_size")
+        if m_model and m_model != auto_model:
+            print(f"[meta] override model_name: {auto_model} -> {m_model} (from ckpt)")
+            auto_model = m_model
+        if isinstance(m_size, int) and m_size != auto_size:
+            print(f"[meta] override image_size: {auto_size} -> {m_size} (from ckpt)")
+            auto_size = int(m_size)
+
+    config.MODEL_NAME = auto_model
+    config.IMAGE_SIZE = auto_size
+    config.DEVICE = args.device
+    print(f"[config] CURRENT_STAGE={config.CURRENT_STAGE} IMAGE_SIZE={config.IMAGE_SIZE} MODEL_NAME={config.MODEL_NAME} DEVICE={config.DEVICE}")
 
     # 依次尝试：CLI 阈值 > meta.json 的 best_thr > 兜底 0.5
     meta = {}
@@ -163,7 +186,7 @@ def main():
         thr = 0.5
         print("[Thr] Using fallback threshold=0.5")
 
-    models = [load_model_from_ckpt(p) for p in ckpts]
+    models = [load_model_from_ckpt(p, model_name=auto_model, img_size=auto_size) for p in ckpts]
 
     _, _, test_tf = get_transforms()
     ds = MedicalDataset(root_dir=config.UNLABELED_TEST_DIR, mode="test", transform=test_tf)

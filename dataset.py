@@ -19,10 +19,10 @@ def get_transforms():
     if not _HAS_ALB:
         return None, None, None
 
-    train_transform = A.Compose([
-        A.HorizontalFlip(p=0.5),
-        # 使用 Affine 并采用新版本参数名：border_mode/value，避免 mode/cval 警告
-        A.Affine(
+    # Stage-aware geometry strength: Stage2 去掉仿射类几何增广，避免高分辨率细节被拉扯
+    affine_transform = None
+    if config.CURRENT_STAGE == 1:
+        affine_transform = A.Affine(
             translate_percent={"x": (-0.03, 0.03), "y": (-0.03, 0.03)},
             scale=(0.95, 1.05),
             rotate=(-10, 10),
@@ -30,12 +30,21 @@ def get_transforms():
             border_mode=cv2.BORDER_CONSTANT,
             value=0,
             p=0.7,
-        ),
+        )
+
+    train_transforms = [
+        A.HorizontalFlip(p=0.5),
+    ]
+    if affine_transform is not None:
+        train_transforms.append(affine_transform)
+    train_transforms.extend([
         A.RandomBrightnessContrast(brightness_limit=0.10, contrast_limit=0.10, p=0.5),
         A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=5, p=0.3),
         A.Normalize(mean=config.IMG_MEAN, std=config.IMG_STD),
         ToTensorV2(),
     ])
+
+    train_transform = A.Compose(train_transforms)
 
     val_transform = A.Compose([
         A.Normalize(mean=config.IMG_MEAN, std=config.IMG_STD),

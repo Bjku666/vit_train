@@ -102,7 +102,7 @@ These sizes are multiples of 224, and they keep all Swin stages aligned.
 MODEL_NAME = os.environ.get("MODEL_NAME", "swin_base_patch4_window7_224")
 
 # drop path 概率（timm create_model 统一入口）
-DROP_PATH_RATE = float(os.environ.get("DROP_PATH_RATE", "0.1"))
+DROP_PATH_RATE = float(os.environ.get("DROP_PATH_RATE", "0"))
 
 # 二分类（BCEWithLogitsLoss）：输出 1 维 logit
 NUM_CLASSES = 1
@@ -141,17 +141,17 @@ if CURRENT_STAGE == 1:
     # Stage 1 (warmup stage): train at 224.
     IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
     EPOCHS = int(os.environ.get("EPOCHS", "25"))
-    BASE_LR = float(os.environ.get("BASE_LR", "7e-5"))
+    BASE_LR = float(os.environ.get("BASE_LR", "8e-5"))
     WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
 else:
     # Stage 2 (hi-res finetune):
     # For Swin window7/patch4, 448 keeps stage alignment.
     IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "448"))
-    EPOCHS = int(os.environ.get("EPOCHS", "6"))
+    EPOCHS = int(os.environ.get("EPOCHS", "8"))
     # 第二阶段短训微调
     BASE_LR = float(os.environ.get("BASE_LR", "3e-6"))
-    WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
+    WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.06"))
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
 
 if CURRENT_STAGE == 1:
@@ -169,10 +169,10 @@ USE_LLRD = os.environ.get("USE_LLRD", "0").lower() not in ["0", "false"]
 LAYER_DECAY = float(os.environ.get("LAYER_DECAY", "0.9"))
 
 # 冻结 → 解冻（仅 Stage2 生效）
-FREEZE_EPOCHS_STAGE2 = int(os.environ.get("FREEZE_EPOCHS_STAGE2", "1"))
+FREEZE_EPOCHS_STAGE2 = int(os.environ.get("FREEZE_EPOCHS_STAGE2", "2"))
 # ViT：冻结前 N 个 blocks；Swin：按 stage.blocks 展平后的前 N 个块
-FREEZE_BLOCKS_BEFORE_STAGE2 = int(os.environ.get("FREEZE_BLOCKS_BEFORE_STAGE2", "0"))
-FREEZE_PATCH_EMBED_STAGE2 = os.environ.get("FREEZE_PATCH_EMBED_STAGE2", "0").lower() not in ["0", "false"]
+FREEZE_BLOCKS_BEFORE_STAGE2 = int(os.environ.get("FREEZE_BLOCKS_BEFORE_STAGE2", "8"))
+FREEZE_PATCH_EMBED_STAGE2 = os.environ.get("FREEZE_PATCH_EMBED_STAGE2", "1").lower() not in ["0", "false"]
 
 
 # =============================

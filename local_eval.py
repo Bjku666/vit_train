@@ -7,16 +7,16 @@ Goal: faithfully mirror the submit/inference pipeline while adding labels
 and threshold search. This file DOES NOT affect submit pipeline automatically.
 """
 import argparse
+import importlib
 import os
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-import config
 
 try:
     import albumentations as A
@@ -27,9 +27,10 @@ except Exception as e:
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
-
 from infer_utils import build_model, smart_load_state_dict, get_ckpt_meta
-from dataset import ben_graham_preprocessing
+
+# 将 config 延迟到解析完 CLI 后再导入（需要读取 CURRENT_STAGE/IMAGE_SIZE 环境变量）
+config = None
 
 
 class FolderBinaryDataset(Dataset):
@@ -38,16 +39,18 @@ class FolderBinaryDataset(Dataset):
     - Label mapping matches training: parent == 'disease' -> 1, else 0.
     - Ben Graham preprocessing is applied, then val/submit normalization.
     """
+
     def __init__(self, root: str, img_size: int):
         self.root = Path(root)
         self.img_size = img_size
+
         # Reuse project's val/test transforms for normalization only
         # (we apply Ben Graham preprocessing beforehand for consistency).
         from dataset import get_transforms
         _, val_tf, _ = get_transforms()
         self.val_tf = val_tf
-        self.samples: List[Tuple[Path, int]] = []
 
+        self.samples: List[Tuple[Path, int]] = []
         for fp in sorted(self.root.rglob("*")):
             if fp.is_file() and fp.suffix.lower() in IMG_EXTS:
                 parent = fp.parent.name.lower()
@@ -65,17 +68,22 @@ class FolderBinaryDataset(Dataset):
     def __getitem__(self, idx):
         path, y = self.samples[idx]
         img = Image.open(path).convert("RGB")
+
         # Apply project Ben Graham preprocessing for consistency
+        from dataset import ben_graham_preprocessing
         img = ben_graham_preprocessing(img, target_size=self.img_size)
         img_np = np.array(img)
+
         x = self.val_tf(image=img_np)["image"]
         return x, torch.tensor(y, dtype=torch.float32), str(path.name)
 
 
-def create_model_for_eval(ckpt_path: str) -> nn.Module:
-    m = build_model()
+def create_model_for_eval(ckpt_path: str, model_name: str, img_size: int, device: str = None) -> nn.Module:
+    global config
+    dev = device or config.DEVICE
+    m = build_model(model_name=model_name, img_size=img_size, device=dev)
     smart_load_state_dict(m, ckpt_path, strict=False)
-    return m.to(config.DEVICE).eval()
+    return m.to(dev).eval()
 
 
 @torch.no_grad()
@@ -183,6 +191,7 @@ def main():
     ap.add_argument("--data_dir", type=str, required=True, help="Path to labeled test folder (contains disease/ normal/)")
     ap.add_argument("--model_name", type=str, required=True, help="timm model name, e.g. swin_base_patch4_window7_224")
     ap.add_argument("--img_size", type=int, default=224)
+    ap.add_argument("--stage", type=int, default=int(os.environ.get("CURRENT_STAGE", "2")), help="Stage id to align config/env (1 or 2)")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -192,6 +201,15 @@ def main():
     ap.add_argument("--out_json", type=str, default="", help="Optional: save summary json")
     ap.add_argument("--out_csv", type=str, default="", help="Optional: save per-image probs csv for the BEST checkpoint")
     args = ap.parse_args()
+
+    # 先同步环境变量，再导入 config（其初始化依赖 env）
+    os.environ["CURRENT_STAGE"] = str(args.stage)
+    os.environ["IMAGE_SIZE"] = str(args.img_size)
+
+    global config
+    import config as cfg
+    importlib.reload(cfg)
+    config = cfg
 
     # 读取首个 ckpt 的 meta，用于自动对齐评测配置，避免模型/尺寸不匹配
     auto_model = args.model_name
@@ -211,6 +229,10 @@ def main():
     config.MODEL_NAME = auto_model
     config.IMAGE_SIZE = auto_size
     config.DEVICE = args.device
+    config.CURRENT_STAGE = int(os.environ.get("CURRENT_STAGE", config.CURRENT_STAGE))
+
+    # 记录当前评测使用的阶段/分辨率/模型，避免误用 Stage1 配置评测 Stage2 权重
+    print(f"[config] CURRENT_STAGE={config.CURRENT_STAGE} IMAGE_SIZE={config.IMAGE_SIZE} MODEL_NAME={config.MODEL_NAME} DEVICE={config.DEVICE}")
 
     # 评测的数据预处理应与模型分辨率一致（防止 Swin attn mask 尺寸不匹配）
     args.img_size = auto_size
@@ -222,11 +244,14 @@ def main():
     )
 
     results = []
+
     # 单模型逐个评测
     for ckpt in args.ckpts:
         ckpt = str(ckpt)
         print(f"\n=== Evaluating: {ckpt}")
-        model = create_model_for_eval(ckpt)
+        model = create_model_for_eval(
+            ckpt, model_name=auto_model, img_size=auto_size, device=args.device
+        )
 
         probs, labels, names = infer_probs(
             model, loader, args.device,
@@ -238,15 +263,30 @@ def main():
         pos_mean = float(probs[pos].mean()) if pos.any() else float("nan")
         neg_mean = float(probs[neg].mean()) if neg.any() else float("nan")
         print(f"[data] pos={int(pos.sum())} neg={int(neg.sum())} pos_prob_mean={pos_mean:.4f} neg_prob_mean={neg_mean:.4f}")
+
         best = best_threshold_by_accuracy(probs, labels, steps=2001)
         f1 = f1_from_counts(best["tp"], best["fp"], best["fn"])
         print(f"[best] thr={best['thr']:.4f} acc={best['acc']:.4f} f1={f1:.4f} "
               f"CM=[[tn fp][fn tp]]=[[{best['tn']} {best['fp']}][{best['fn']} {best['tp']}]]")
+                # ====== DEBUG: 固定阈值下的指标（用来对比 best_thr 是否“虚高/不稳定”）======
+        for t in [0.5, 0.2, 0.9]:
+            pred_t = (probs >= t).astype(np.int32)
+            y = labels.astype(np.int32)
+            tp = int(((pred_t == 1) & (y == 1)).sum())
+            tn = int(((pred_t == 0) & (y == 0)).sum())
+            fp = int(((pred_t == 1) & (y == 0)).sum())
+            fn = int(((pred_t == 0) & (y == 1)).sum())
+            acc_t = (tp + tn) / max(1, (tp + tn + fp + fn))
+            f1_t = f1_from_counts(tp, fp, fn)
+            print(f"[fixed] thr={t:.3f} acc={acc_t:.4f} f1={f1_t:.4f} "
+                  f"CM=[[tn fp][fn tp]]=[[{tn} {fp}][{fn} {tp}]]")
+
 
         results.append({
             "ckpt": ckpt,
-            "model_name": args.model_name,
-            "img_size": args.img_size,
+            # 用 auto_*（可能被 ckpt meta 覆盖）避免记录错误参数
+            "model_name": auto_model,
+            "img_size": auto_size,
             "tta": bool(args.tta),
             "best_thr": best["thr"],
             "acc": best["acc"],
@@ -258,15 +298,23 @@ def main():
     # 多模型融合评测（若选择了多个 ckpt）
     if len(args.ckpts) > 1:
         print(f"\n=== Evaluating Ensemble ({len(args.ckpts)} ckpts)")
-        ens_models = [create_model_for_eval(p) for p in args.ckpts]
+
+        # ✅ 修复：补齐参数
+        ens_models = [
+            create_model_for_eval(p, model_name=auto_model, img_size=auto_size, device=args.device)
+            for p in args.ckpts
+        ]
+
         probs, labels, names = infer_probs_ensemble(
             ens_models, loader, args.device, tta_hflip=args.tta, use_amp=(not args.no_amp)
         )
+
         pos = labels == 1
         neg = labels == 0
         pos_mean = float(probs[pos].mean()) if pos.any() else float("nan")
         neg_mean = float(probs[neg].mean()) if neg.any() else float("nan")
         print(f"[data] pos={int(pos.sum())} neg={int(neg.sum())} pos_prob_mean={pos_mean:.4f} neg_prob_mean={neg_mean:.4f}")
+
         best = best_threshold_by_accuracy(probs, labels, steps=2001)
         f1 = f1_from_counts(best["tp"], best["fp"], best["fn"])
         print(f"[best][Ensemble] thr={best['thr']:.4f} acc={best['acc']:.4f} f1={f1:.4f} "
@@ -274,8 +322,8 @@ def main():
 
         results.append({
             "ckpt": f"ensemble({len(args.ckpts)})",
-            "model_name": args.model_name,
-            "img_size": args.img_size,
+            "model_name": auto_model,
+            "img_size": auto_size,
             "tta": bool(args.tta),
             "best_thr": best["thr"],
             "acc": best["acc"],
@@ -301,12 +349,34 @@ def main():
             json.dump({"results": results}, f, indent=2, ensure_ascii=False)
         print(f"\nSaved: {out_json}")
 
-    # Optionally dump per-image probabilities for the BEST ckpt (top-1)
+    # Optionally dump per-image probabilities for the BEST *single* checkpoint
     if args.out_csv and len(results) > 0:
-        best_ckpt = results[0]["ckpt"]
-        model = create_model_for_eval(best_ckpt)
-        probs, labels, names = infer_probs(model, loader, args.device, tta_hflip=args.tta, use_amp=(not args.no_amp))
-        thr = results[0]["best_thr"]
+        # 如果 top1 是 ensemble(x)，就回退到最好的单模型 ckpt
+        best_ckpt = None
+        for r in results:
+            p = r.get("ckpt", "")
+            if isinstance(p, str) and os.path.isfile(p):
+                best_ckpt = p
+                break
+        if best_ckpt is None:
+            raise RuntimeError("No valid checkpoint file found to dump CSV.")
+
+        model = create_model_for_eval(
+            best_ckpt, model_name=auto_model, img_size=auto_size, device=args.device
+        )
+        probs, labels, names = infer_probs(
+            model, loader, args.device, tta_hflip=args.tta, use_amp=(not args.no_amp)
+        )
+
+        # ✅ thr 用对应 ckpt 的 best_thr（不要拿 ensemble 的阈值）
+        thr = None
+        for r in results:
+            if r.get("ckpt") == best_ckpt:
+                thr = r.get("best_thr")
+                break
+        if thr is None:
+            thr = 0.5
+
         pred = (probs >= thr).astype(np.int32)
 
         import csv

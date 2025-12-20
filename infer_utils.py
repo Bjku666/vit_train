@@ -8,20 +8,30 @@ import config
 from model import get_model
 
 
-def build_model() -> nn.Module:
-    """统一构建当前配置下的模型（训练/提交/本地评测一致）。"""
-    model = get_model().to(config.DEVICE)
+def build_model(model_name: str = None, img_size: int = None, drop_path_rate: float = None, device: str = None) -> nn.Module:
+    """统一构建模型；允许显式覆盖 model/img_size/drop_path_rate/设备，避免评测阶段依赖环境变量。"""
+    dev = device or config.DEVICE
+    model = get_model(model_name=model_name, img_size=img_size, drop_path_rate=drop_path_rate).to(dev)
     return model
 
 
 def _extract_state_dict(obj: Any) -> Dict[str, torch.Tensor]:
-    """从 ckpt 对象中提取 state_dict（兼容多种保存格式）。"""
-    if isinstance(obj, dict):
-        for k in ["state_dict", "model", "model_state_dict", "net"]:
-            v = obj.get(k)
-            if isinstance(v, dict):
-                return v
+    """从 ckpt 对象中提取 state_dict，优先返回 EMA 权重。"""
+    if not isinstance(obj, dict):
         return obj
+
+    # 优先使用 EMA 权重（若存在）
+    for k in ["model_ema", "ema", "ema_state_dict"]:
+        v = obj.get(k)
+        if isinstance(v, dict):
+            return v
+
+    # 其次使用常规模型权重
+    for k in ["state_dict", "model", "model_state_dict", "net"]:
+        v = obj.get(k)
+        if isinstance(v, dict):
+            return v
+
     return obj  # 可能直接是 state_dict
 
 
@@ -77,8 +87,8 @@ def smart_load_state_dict(model: nn.Module, ckpt_path: str, strict: bool = False
     return loaded, missing, unexpected
 
 
-def load_model_from_ckpt(ckpt_path: str) -> nn.Module:
-    model = build_model()
+def load_model_from_ckpt(ckpt_path: str, model_name: str = None, img_size: int = None, drop_path_rate: float = None, device: str = None) -> nn.Module:
+    model = build_model(model_name=model_name, img_size=img_size, drop_path_rate=drop_path_rate, device=device)
     smart_load_state_dict(model, ckpt_path, strict=False)
     model.eval()
     return model

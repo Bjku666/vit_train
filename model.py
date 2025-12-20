@@ -200,28 +200,33 @@ def load_retfound_weights(vit_backbone: nn.Module, weight_path: str) -> Tuple[in
     return missing, unexpected
 
 
-def get_model() -> nn.Module:
-    name = config.MODEL_NAME.lower()
-    dp_rate = getattr(config, "DROP_PATH_RATE", 0.1)
+def get_model(model_name: str = None, img_size: int = None, drop_path_rate: float = None) -> nn.Module:
+    """构建模型，允许覆盖 config 中的 model_name/img_size/drop_path_rate（评测/推理可显式传参）。"""
+    resolved_model = model_name or config.MODEL_NAME
+    resolved_img = img_size or config.IMAGE_SIZE
+    name = resolved_model.lower()
+    dp_rate = getattr(config, "DROP_PATH_RATE", 0.1) if drop_path_rate is None else drop_path_rate
 
     # -----------------------------
     # Swin / ConvNeXt 等（默认 ImageNet 预训练）
+    # Stage2: 绝对禁止加载任何 pretrained，避免覆盖 stage1 init_ckpt
     # -----------------------------
     if "swin" in name:
-        # 不再使用 timm 的 checkpoint_path（其内部为 strict 加载）。
-        # 当存在本地权重时：先构建未预训练的模型，再手动 strict=False 加载；
-        # 否则：使用 timm 的 ImageNet 预训练权重。
-        has_local = os.path.exists(config.SWIN_CHECKPOINT_PATH)
+        is_stage2 = int(os.environ.get("CURRENT_STAGE", str(getattr(config, "CURRENT_STAGE", 1)))) == 2
+
+        # Stage2 一律 pretrained=False；Stage1 允许使用本地/网络预训练
+        has_local = (not is_stage2) and os.path.exists(config.SWIN_CHECKPOINT_PATH)
+
         backbone = timm.create_model(
-            config.MODEL_NAME,
-            pretrained=(not has_local),
+            resolved_model,
+            pretrained=(False if is_stage2 else (not has_local)),
             num_classes=0,
             global_pool="",
-            img_size=config.IMAGE_SIZE,  # 确保 patch_embed/grid_size 与当前阶段分辨率一致
+            img_size=resolved_img,
             drop_path_rate=dp_rate,
         )
 
-        # 允许可变输入尺寸（Stage2 可能使用 448/512）
+        # 允许可变输入尺寸
         try:
             if hasattr(backbone, "patch_embed"):
                 backbone.patch_embed.strict_img_size = False
@@ -232,8 +237,10 @@ def get_model() -> nn.Module:
         except Exception:
             pass
 
-        src = "timm pretrained"
+        src = "no-pretrained (stage2)" if is_stage2 else "timm pretrained"
         missing = unexpected = None
+
+        # 只有 Stage1 才允许加载你本地 SWIN_CHECKPOINT_PATH（避免 Stage2 覆盖 stage1 init_ckpt）
         if has_local:
             state = _load_checkpoint(config.SWIN_CHECKPOINT_PATH)
             state = _match_and_filter_state_dict(backbone, state)
@@ -243,15 +250,16 @@ def get_model() -> nn.Module:
             src = f"manual strict=False from {config.SWIN_CHECKPOINT_PATH} (loaded={len(state)})"
 
         model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
-        print(f"[Model] Swin backbone: {config.MODEL_NAME} | {src} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
+        print(f"[Model] Swin backbone: {resolved_model} | {src} | img={resolved_img} | num_classes={config.NUM_CLASSES}")
         return model
+
 
     # -----------------------------
     # ViT (RETFound)
     # -----------------------------
     if "vit" in name:
         # 创建不带分类头的 timm ViT 主干
-        backbone = timm.create_model(config.MODEL_NAME, pretrained=False, num_classes=0, global_pool="", drop_path_rate=dp_rate)
+        backbone = timm.create_model(resolved_model, pretrained=False, num_classes=0, global_pool="", drop_path_rate=dp_rate)
 
         # 允许可变输入尺寸（Stage2 可能使用 448/512）
         try:
@@ -273,14 +281,14 @@ def get_model() -> nn.Module:
 
         if config.USE_GEM:
             model = RETFoundViTGeM(backbone, num_classes=config.NUM_CLASSES)
-            print(f"[Model] RETFound+GeM | {config.MODEL_NAME} | img={config.IMAGE_SIZE} | missing={missing} unexpected={unexpected}")
+            print(f"[Model] RETFound+GeM | {resolved_model} | img={resolved_img} | missing={missing} unexpected={unexpected}")
         else:
             model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
-            print(f"[Model] RETFound ViT | {config.MODEL_NAME} | img={config.IMAGE_SIZE} | missing={missing} unexpected={unexpected}")
+            print(f"[Model] RETFound ViT | {resolved_model} | img={resolved_img} | missing={missing} unexpected={unexpected}")
         return model
 
     # 回退：任意 timm 模型
-    backbone = timm.create_model(config.MODEL_NAME, pretrained=True, num_classes=0, global_pool="", drop_path_rate=dp_rate)
+    backbone = timm.create_model(resolved_model, pretrained=True, num_classes=0, global_pool="", drop_path_rate=dp_rate)
 
     # 允许可变输入尺寸（Stage2 可能使用 448/512）
     try:
@@ -298,5 +306,5 @@ def get_model() -> nn.Module:
     except Exception:
         pass
     model = TimmBinaryClassifier(backbone, num_classes=config.NUM_CLASSES)
-    print(f"[Model] timm backbone: {config.MODEL_NAME} | img={config.IMAGE_SIZE} | num_classes={config.NUM_CLASSES}")
+    print(f"[Model] timm backbone: {resolved_model} | img={resolved_img} | num_classes={config.NUM_CLASSES}")
     return model
