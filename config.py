@@ -21,10 +21,10 @@ RETFOUND_PATH = os.path.join(PRETRAINED_DIR, "RETFound_cfp_weights.pth")
 
 
 # =============================
-# 运行 ID（单阶段：仅 Stage1）
+# 运行 ID 与阶段（Stage1/Stage2）
 # =============================
 RUN_ID = os.environ.get("RUN_ID", "").strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
-CURRENT_STAGE = 1  # 单阶段流程
+CURRENT_STAGE = int(os.environ.get("CURRENT_STAGE", "1"))
 
 CURRENT_RUN_MODELS_DIR = os.path.join(MODELS_DIR, f"run_{RUN_ID}")
 CURRENT_LOG_DIR = os.path.join(LOG_DIR, RUN_ID)
@@ -56,18 +56,18 @@ def _first_existing_dir(base: str, candidates):
             return p
     return os.path.join(base, candidates[0])  # 若都不存在，回退到首选项（便于后续报错信息统一）
 
-# 训练集
+# 训练集可能被命名为 TrainSet，这里做健壮处理
 _TRAIN_CANDIDATES = [
     os.environ.get("TRAIN_DIR_NAME", "2-MedImage-TrainSet"),
-    "2-MedImage-TrainSet",
+    "2-MedImage-TrainSet",   # 你的当前目录名
 ]
 
 LABELED_TRAIN_DIR = _first_existing_dir(DATA_DIR, _TRAIN_CANDIDATES)
 
-# 推理/提交时所用的无标签测试集目录
+# 推理/提交时所用的无标签测试集目录（同样做名称兼容）
 _TEST_CANDIDATES = [
     os.environ.get("TEST_DIR_NAME", "MedImage-TestSet"),
-    "MedImage-TrainSet",
+    "MedImage-TestSet",
 ]
 UNLABELED_TEST_DIR = _first_existing_dir(DATA_DIR, _TEST_CANDIDATES)
 
@@ -81,20 +81,24 @@ TRAIN_DIRS = [LABELED_TRAIN_DIR]
 # 主干模型：
 # - Swin（推荐基线）：swin_base_patch4_window12_384
 # - ViT（RETFound）：vit_base_patch16_384 / vit_large_patch16_384 等
-"""Project config (single-stage).
+"""Project config.
 
 NOTE (important for Swin):
 `swin_*_window12_384` models in timm are often hard-bound to img_size=384.
 Even if you pass `img_size=...`, some internal asserts / mask logic can still
 break when you feed 448/480/512.
 
-Default uses window7-224 Swin at 224 resolution.
+For a stable 2-stage pipeline (stage1=224 -> stage2=448), use a window7-224
+Swin as default:
+    - stage1: 224
+    - stage2: 448
+These sizes are multiples of 224, and they keep all Swin stages aligned.
 """
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "swin_base_patch4_window7_224")
 
 # drop path 概率（timm create_model 统一入口）
-DROP_PATH_RATE = float(os.environ.get("DROP_PATH_RATE", "0"))
+DROP_PATH_RATE = float(os.environ.get("DROP_PATH_RATE", "0.1"))
 
 # 二分类（BCEWithLogitsLoss）：输出 1 维 logit
 NUM_CLASSES = 1
@@ -128,22 +132,43 @@ NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "16"))
 SPLIT_DIR = os.path.join(BASE_DIR, "splits")
 SPLIT_FILE = os.path.join(SPLIT_DIR, f"single_split_seed{SEED}_val{int(VAL_RATIO*100)}.json")
 
-# 单阶段训练参数
-IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
-EPOCHS = int(os.environ.get("EPOCHS", "25"))
-BASE_LR = float(os.environ.get("BASE_LR", "8e-5"))
-WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
-ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "1"))
+# 渐进分辨率
+if CURRENT_STAGE == 1:
+    # Stage 1 (warmup stage): train at 224.
+    IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "224"))
+    EPOCHS = int(os.environ.get("EPOCHS", "25"))
+    BASE_LR = float(os.environ.get("BASE_LR", "8e-5"))
+    WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.05"))
+    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "8"))
+else:
+    # Stage 2 (hi-res finetune):
+    # For Swin window7/patch4, 448 keeps stage alignment.
+    IMAGE_SIZE = int(os.environ.get("IMAGE_SIZE", "448"))
+    EPOCHS = int(os.environ.get("EPOCHS", "8"))
+    # 第二阶段短训微调
+    BASE_LR = float(os.environ.get("BASE_LR", "3e-6"))
+    WEIGHT_DECAY = float(os.environ.get("WEIGHT_DECAY", "0.06"))
+    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "4"))
+
+if CURRENT_STAGE == 1:
+    ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "1"))
+else:
+    ACCUM_STEPS = int(os.environ.get("ACCUM_STEPS", "2"))
 # 梯度裁剪
 CLIP_GRAD_NORM = float(os.environ.get("CLIP_GRAD_NORM", "1.0"))
 
 
 # =============================
-# LLRD 设置
+# LLRD / 第二阶段冻结策略
 # =============================
-USE_LLRD = os.environ.get("USE_LLRD", "0").lower() not in ["0", "false"]
+USE_LLRD = os.environ.get("USE_LLRD", "1").lower() not in ["0", "false"]
 LAYER_DECAY = float(os.environ.get("LAYER_DECAY", "0.9"))
+
+# 冻结 → 解冻（仅 Stage2 生效）
+FREEZE_EPOCHS_STAGE2 = int(os.environ.get("FREEZE_EPOCHS_STAGE2", "2"))
+# ViT：冻结前 N 个 blocks；Swin：按 stage.blocks 展平后的前 N 个块
+FREEZE_BLOCKS_BEFORE_STAGE2 = int(os.environ.get("FREEZE_BLOCKS_BEFORE_STAGE2", "8"))
+FREEZE_PATCH_EMBED_STAGE2 = os.environ.get("FREEZE_PATCH_EMBED_STAGE2", "1").lower() not in ["0", "false"]
 
 
 # =============================

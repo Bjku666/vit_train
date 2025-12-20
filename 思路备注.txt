@@ -71,10 +71,22 @@ Checkpoint 与日志
 	- 启用 TTA 水平翻转：`Y`
 - 脚本会在 output/ 生成文件：`submission_20251219_215519_stage1_swin_base_patch4_window7_224_swin_base_patch4_window7_224_stage1_epoch021.csv`
 
-当前生效的训练超参（最新 config）
+
+思路是vitbase达到91%，想要冲的更高选择retfound但是怎么调整都不好用。最后选择swim，使用两阶段调优，但是stage1 224分辨率效果不错，但是stage2效果很差。所以最终准备还是只是用stage1来做
+
+目前只使用stage1，不再使用stage2，经过多轮测试发现是分辨率太高导致不好调整
+当前生效的训练超参数
+对比1：
 - 模型：swin_base_patch4_window7_224，DROP_PATH_RATE=0.1，NUM_CLASSES=1
 - 种子/硬件：SEED=2025，NUM_WORKERS=16，设备 CUDA 自动
 - Stage1：IMAGE_SIZE=224，EPOCHS=25，LR=8e-5，WD=0.05，BATCH=8，ACCUM=1
 - Stage2：IMAGE_SIZE=448，EPOCHS=10，LR=7e-6，WD=0.05，BATCH=4，ACCUM=2
 - 优化/正则：AdamW，梯度裁剪 1.0，EMA=0.9999，LLRD 默认关（layer_decay=0.9），Mixup 默认关
 - 预处理：Ben Graham sigma=max(1, image_size/30) + CLAHE(clip=2.0, grid=8)，归一化 mean/std 同 ImageNet
+
+对比2：
+使用seed 42其他皆不变
+run_20251220_193525
+
+对比3：
+使用seed 520其他皆不变

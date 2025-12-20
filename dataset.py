@@ -19,25 +19,31 @@ def get_transforms():
     if not _HAS_ALB:
         return None, None, None
 
-    affine_transform = A.Affine(
-        translate_percent={"x": (-0.03, 0.03), "y": (-0.03, 0.03)},
-        scale=(0.95, 1.05),
-        rotate=(-10, 10),
-        shear=(-5, 5),
-        border_mode=cv2.BORDER_CONSTANT,
-        value=0,
-        p=0.7,
-    )
+    # Stage-aware geometry strength: Stage2 去掉仿射类几何增广，避免高分辨率细节被拉扯
+    affine_transform = None
+    if config.CURRENT_STAGE == 1:
+        affine_transform = A.Affine(
+            translate_percent={"x": (-0.03, 0.03), "y": (-0.03, 0.03)},
+            scale=(0.95, 1.05),
+            rotate=(-10, 10),
+            shear=(-5, 5),
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+            p=0.7,
+        )
 
     train_transforms = [
         A.HorizontalFlip(p=0.5),
-        affine_transform,
+    ]
+    if affine_transform is not None:
+        train_transforms.append(affine_transform)
+    train_transforms.extend([
         A.RandomBrightnessContrast(brightness_limit=0.10, contrast_limit=0.10, p=0.5),
         A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=5, p=0.3),
         A.Normalize(mean=config.IMG_MEAN, std=config.IMG_STD),
         ToTensorV2(),
-    ]
-    
+    ])
+
     train_transform = A.Compose(train_transforms)
 
     val_transform = A.Compose([
@@ -86,8 +92,8 @@ def ben_graham_preprocessing(image, target_size=config.IMAGE_SIZE):
     # 在做 CLAHE 之前 Resize，可以大幅节省计算时间
     img_resized = cv2.resize(img_cropped, (target_size, target_size))
 
-    # --- 步骤 3: Ben Graham 高斯模糊差分，单阶段 sigma ---
-    sigma = float(target_size) / 56.0
+    # --- 步骤 3: Ben Graham 高斯模糊差分，sigma 随分辨率缩放 ---
+    sigma = max(1, image_size / 30)
     blurred = cv2.GaussianBlur(img_resized, (0, 0), sigmaX=sigma, sigmaY=sigma)
     img_resized = cv2.addWeighted(img_resized, 4.0, blurred, -4.0, 128)
     img_resized = np.clip(img_resized, 0, 255).astype(np.uint8)

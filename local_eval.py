@@ -7,6 +7,7 @@ Goal: faithfully mirror the submit/inference pipeline while adding labels
 and threshold search. This file DOES NOT affect submit pipeline automatically.
 """
 import argparse
+import importlib
 import os
 from pathlib import Path
 from typing import List, Tuple
@@ -27,7 +28,9 @@ except Exception as e:
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 from infer_utils import build_model, smart_load_state_dict, get_ckpt_meta
-import config
+
+# 将 config 延迟到解析完 CLI 后再导入（需要读取 CURRENT_STAGE/IMAGE_SIZE 环境变量）
+config = None
 
 
 class FolderBinaryDataset(Dataset):
@@ -188,6 +191,7 @@ def main():
     ap.add_argument("--data_dir", type=str, required=True, help="Path to labeled test folder (contains disease/ normal/)")
     ap.add_argument("--model_name", type=str, required=True, help="timm model name, e.g. swin_base_patch4_window7_224")
     ap.add_argument("--img_size", type=int, default=224)
+    ap.add_argument("--stage", type=int, default=int(os.environ.get("CURRENT_STAGE", "2")), help="Stage id to align config/env (1 or 2)")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -198,7 +202,14 @@ def main():
     ap.add_argument("--out_csv", type=str, default="", help="Optional: save per-image probs csv for the BEST checkpoint")
     args = ap.parse_args()
 
-    config.IMAGE_SIZE = args.img_size
+    # 先同步环境变量，再导入 config（其初始化依赖 env）
+    os.environ["CURRENT_STAGE"] = str(args.stage)
+    os.environ["IMAGE_SIZE"] = str(args.img_size)
+
+    global config
+    import config as cfg
+    importlib.reload(cfg)
+    config = cfg
 
     # 读取首个 ckpt 的 meta，用于自动对齐评测配置，避免模型/尺寸不匹配
     auto_model = args.model_name
@@ -218,9 +229,10 @@ def main():
     config.MODEL_NAME = auto_model
     config.IMAGE_SIZE = auto_size
     config.DEVICE = args.device
+    config.CURRENT_STAGE = int(os.environ.get("CURRENT_STAGE", config.CURRENT_STAGE))
 
-    # 记录当前评测使用的分辨率/模型
-    print(f"[config] IMAGE_SIZE={config.IMAGE_SIZE} MODEL_NAME={config.MODEL_NAME} DEVICE={config.DEVICE}")
+    # 记录当前评测使用的阶段/分辨率/模型，避免误用 Stage1 配置评测 Stage2 权重
+    print(f"[config] CURRENT_STAGE={config.CURRENT_STAGE} IMAGE_SIZE={config.IMAGE_SIZE} MODEL_NAME={config.MODEL_NAME} DEVICE={config.DEVICE}")
 
     # 评测的数据预处理应与模型分辨率一致（防止 Swin attn mask 尺寸不匹配）
     args.img_size = auto_size
@@ -287,7 +299,7 @@ def main():
     if len(args.ckpts) > 1:
         print(f"\n=== Evaluating Ensemble ({len(args.ckpts)} ckpts)")
 
-        # ✅ 修复：补齐参数
+        # 修复：补齐参数
         ens_models = [
             create_model_for_eval(p, model_name=auto_model, img_size=auto_size, device=args.device)
             for p in args.ckpts
@@ -356,7 +368,7 @@ def main():
             model, loader, args.device, tta_hflip=args.tta, use_amp=(not args.no_amp)
         )
 
-        # ✅ thr 用对应 ckpt 的 best_thr（不要拿 ensemble 的阈值）
+        # thr 用对应 ckpt 的 best_thr（不要拿 ensemble 的阈值）
         thr = None
         for r in results:
             if r.get("ckpt") == best_ckpt:
