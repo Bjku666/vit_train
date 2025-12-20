@@ -209,17 +209,13 @@ def get_model(model_name: str = None, img_size: int = None, drop_path_rate: floa
 
     # -----------------------------
     # Swin / ConvNeXt 等（默认 ImageNet 预训练）
-    # Stage2: 绝对禁止加载任何 pretrained，避免覆盖 stage1 init_ckpt
     # -----------------------------
     if "swin" in name:
-        is_stage2 = int(os.environ.get("CURRENT_STAGE", str(getattr(config, "CURRENT_STAGE", 1)))) == 2
-
-        # Stage2 一律 pretrained=False；Stage1 允许使用本地/网络预训练
-        has_local = (not is_stage2) and os.path.exists(config.SWIN_CHECKPOINT_PATH)
+        has_local = os.path.exists(config.SWIN_CHECKPOINT_PATH)
 
         backbone = timm.create_model(
             resolved_model,
-            pretrained=(False if is_stage2 else (not has_local)),
+            pretrained=(not has_local),
             num_classes=0,
             global_pool="",
             img_size=resolved_img,
@@ -237,10 +233,9 @@ def get_model(model_name: str = None, img_size: int = None, drop_path_rate: floa
         except Exception:
             pass
 
-        src = "no-pretrained (stage2)" if is_stage2 else "timm pretrained"
+        src = "timm pretrained"
         missing = unexpected = None
 
-        # 只有 Stage1 才允许加载你本地 SWIN_CHECKPOINT_PATH（避免 Stage2 覆盖 stage1 init_ckpt）
         if has_local:
             state = _load_checkpoint(config.SWIN_CHECKPOINT_PATH)
             state = _match_and_filter_state_dict(backbone, state)

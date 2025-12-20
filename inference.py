@@ -113,7 +113,7 @@ def main():
     parser.add_argument("--ckpt", type=str, default="", help="权重路径/目录/通配（默认：当前运行目录）")
     parser.add_argument("--ckpts", type=str, nargs="+", default=None,
                         help="显式指定多个 ckpt 路径（用于集成）。提供该参数时将忽略 --ckpt/--pattern/--select")
-    parser.add_argument("--pattern", type=str, default="*_stage2_*.pth", help="在目录内匹配的通配模式")
+    parser.add_argument("--pattern", type=str, default="*_stage1_*.pth", help="在目录内匹配的通配模式")
     parser.add_argument("--select", type=str, default="best", help="best | last | epoch:NNN")
     parser.add_argument("--avg_last_k", type=int, default=0, help="对最后 K 个 epoch 权重做均值")
     parser.add_argument("--threshold", type=float, default=None, help="手动覆盖阈值")
@@ -148,7 +148,7 @@ def main():
     config.MODEL_NAME = auto_model
     config.IMAGE_SIZE = auto_size
     config.DEVICE = args.device
-    print(f"[config] CURRENT_STAGE={config.CURRENT_STAGE} IMAGE_SIZE={config.IMAGE_SIZE} MODEL_NAME={config.MODEL_NAME} DEVICE={config.DEVICE}")
+    print(f"[config] IMAGE_SIZE={config.IMAGE_SIZE} MODEL_NAME={config.MODEL_NAME} DEVICE={config.DEVICE}")
 
     # 依次尝试：CLI 阈值 > meta.json 的 best_thr > 兜底 0.5
     meta = {}
@@ -159,7 +159,6 @@ def main():
 
     ckpt_dirs = sorted({os.path.dirname(p) or "." for p in ckpts})
     for d in ckpt_dirs:
-        meta_candidates.extend(sorted(glob.glob(os.path.join(d, f"*stage{config.CURRENT_STAGE}_meta.json"))))
         meta_candidates.extend(sorted(glob.glob(os.path.join(d, "*_meta.json"))))
 
     for mp in meta_candidates:
@@ -201,7 +200,7 @@ def main():
     if args.output_csv:
         out_csv = args.output_csv
     else:
-        stage_tag = os.environ.get("CURRENT_STAGE", "")
+        stage_tag = "1"
         model_tag = os.environ.get("MODEL_NAME", "model")
         if len(ckpts) == 1:
             ckpt_tag = os.path.splitext(os.path.basename(ckpts[0]))[0]
