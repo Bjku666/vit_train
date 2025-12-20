@@ -21,7 +21,7 @@ echo "----------------------------------------"
 echo "查找可用 RUN：models/run_*"
 mapfile -t RUN_DIRS < <(find models -maxdepth 1 -type d -name "run_*" | sort -r)
 if [ ${#RUN_DIRS[@]} -eq 0 ]; then
-  echo "未找到任何 models/run_* 目录。请先训练或将权重放入 models/ 下。"
+  echo "❌ 未找到任何 models/run_* 目录。请先训练或将权重放入 models/ 下。"
   exit 1
 fi
 echo "可选择的 RUN:"
@@ -33,7 +33,7 @@ done
 read -p "选择要使用的 RUN（数字）[1]: " RUN_IDX
 RUN_IDX=${RUN_IDX:-1}
 if ! [[ "$RUN_IDX" =~ ^[0-9]+$ ]] || [ "$RUN_IDX" -lt 1 ] || [ "$RUN_IDX" -gt ${#RUN_DIRS[@]} ]; then
-  echo "非法 RUN 选择: $RUN_IDX"
+  echo "❌ 非法 RUN 选择: $RUN_IDX"
   exit 1
 fi
 TARGET_RUN_DIR=${RUN_DIRS[$((RUN_IDX-1))]}
@@ -43,7 +43,7 @@ echo "----------------------------------------"
 echo "可选的 Stage${STAGE} checkpoint:"
 mapfile -t STAGE_CKPTS < <(find "$TARGET_RUN_DIR" -maxdepth 1 -type f -name "*_stage${STAGE}_*.pth" | sort)
 if [ ${#STAGE_CKPTS[@]} -eq 0 ]; then
-  echo "该 RUN 下未找到 *_stage${STAGE}_*.pth，可手动输入路径/通配。"
+  echo "⚠️ 该 RUN 下未找到 *_stage${STAGE}_*.pth，可手动输入路径/通配。"
 else
   j=1
   for p in "${STAGE_CKPTS[@]}"; do
@@ -66,18 +66,18 @@ TOKENS=( $SELECTION )
 for t in "${TOKENS[@]}"; do
   if [[ "$t" =~ ^[0-9]+$ ]]; then
     if [ ${#STAGE_CKPTS[@]} -eq 0 ]; then
-      echo "无可编号的 ckpt，且输入为数字。"
+      echo "❌ 无可编号的 ckpt，且输入为数字。"
       exit 1
     fi
     if [ "$t" -lt 1 ] || [ "$t" -gt ${#STAGE_CKPTS[@]} ]; then
-      echo "编号越界: $t"
+      echo "❌ 编号越界: $t"
       exit 1
     fi
     MODEL_PATHS+=( "${STAGE_CKPTS[$((t-1))]}" )
   else
     eval "EXPANDED=( $t )"
     if [ ${#EXPANDED[@]} -eq 0 ]; then
-      echo "路径/通配未匹配: $t"
+      echo "❌ 路径/通配未匹配: $t"
       exit 1
     fi
     MODEL_PATHS+=( "${EXPANDED[@]}" )
@@ -85,7 +85,7 @@ for t in "${TOKENS[@]}"; do
 done
 
 if [ ${#MODEL_PATHS[@]} -eq 0 ]; then
-  echo "No model path resolved. Abort."
+  echo "❌ No model path resolved. Abort."
   exit 1
 fi
 

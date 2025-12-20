@@ -93,7 +93,7 @@ def ben_graham_preprocessing(image, target_size=config.IMAGE_SIZE):
     img_resized = cv2.resize(img_cropped, (target_size, target_size))
 
     # --- 步骤 3: Ben Graham 高斯模糊差分，sigma 随分辨率缩放 ---
-    sigma = max(1, image_size / 30)
+    sigma = max(float(config.BEN_GRAHAM_MIN_SIGMA), float(target_size) / float(config.BEN_GRAHAM_SIGMA_DIVISOR))
     blurred = cv2.GaussianBlur(img_resized, (0, 0), sigmaX=sigma, sigmaY=sigma)
     img_resized = cv2.addWeighted(img_resized, 4.0, blurred, -4.0, 128)
     img_resized = np.clip(img_resized, 0, 255).astype(np.uint8)

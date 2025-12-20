@@ -299,7 +299,7 @@ def main():
     if len(args.ckpts) > 1:
         print(f"\n=== Evaluating Ensemble ({len(args.ckpts)} ckpts)")
 
-        # 修复：补齐参数
+        # ✅ 修复：补齐参数
         ens_models = [
             create_model_for_eval(p, model_name=auto_model, img_size=auto_size, device=args.device)
             for p in args.ckpts
@@ -368,7 +368,7 @@ def main():
             model, loader, args.device, tta_hflip=args.tta, use_amp=(not args.no_amp)
         )
 
-        # thr 用对应 ckpt 的 best_thr（不要拿 ensemble 的阈值）
+        # ✅ thr 用对应 ckpt 的 best_thr（不要拿 ensemble 的阈值）
         thr = None
         for r in results:
             if r.get("ckpt") == best_ckpt:

@@ -56,10 +56,12 @@ def _first_existing_dir(base: str, candidates):
             return p
     return os.path.join(base, candidates[0])  # 若都不存在，回退到首选项（便于后续报错信息统一）
 
-# 训练集可能被命名为 TrainSet，这里做健壮处理
+# 训练集可能被命名为 TrainSet 或 TestSet，这里做健壮处理
 _TRAIN_CANDIDATES = [
     os.environ.get("TRAIN_DIR_NAME", "2-MedImage-TrainSet"),
-    "2-MedImage-TrainSet",   # 你的当前目录名
+    "MedImage-TrainSet",
+    "2-MedImage-TestSet",   # 你的当前目录名
+    "MedImage-TestSet",
 ]
 
 LABELED_TRAIN_DIR = _first_existing_dir(DATA_DIR, _TRAIN_CANDIDATES)
@@ -67,7 +69,9 @@ LABELED_TRAIN_DIR = _first_existing_dir(DATA_DIR, _TRAIN_CANDIDATES)
 # 推理/提交时所用的无标签测试集目录（同样做名称兼容）
 _TEST_CANDIDATES = [
     os.environ.get("TEST_DIR_NAME", "MedImage-TestSet"),
-    "MedImage-TestSet",
+    "2-MedImage-TestSet",
+    "MedImage-TrainSet",
+    "2-MedImage-TrainSet",
 ]
 UNLABELED_TEST_DIR = _first_existing_dir(DATA_DIR, _TEST_CANDIDATES)
 
@@ -161,7 +165,7 @@ CLIP_GRAD_NORM = float(os.environ.get("CLIP_GRAD_NORM", "1.0"))
 # =============================
 # LLRD / 第二阶段冻结策略
 # =============================
-USE_LLRD = os.environ.get("USE_LLRD", "1").lower() not in ["0", "false"]
+USE_LLRD = os.environ.get("USE_LLRD", "0").lower() not in ["0", "false"]
 LAYER_DECAY = float(os.environ.get("LAYER_DECAY", "0.9"))
 
 # 冻结 → 解冻（仅 Stage2 生效）
